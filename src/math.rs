@@ -130,6 +130,16 @@ pub enum Expr {
     Call(String, Vec<Expr>),
     /// Par ordenado (punto).
     Tuple(Vec<Expr>),
+    /// Expresión con dominio restringido: `x^2 {x > 0}` (en definiciones de funciones).
+    Restrict(Box<Expr>, Vec<Restriction>),
+}
+
+/// Condición `lhs <op> rhs` de una restricción `{…}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Restriction {
+    pub lhs: Expr,
+    pub rhs: Expr,
+    pub cmp: Comparison,
 }
 
 impl Expr {
@@ -421,17 +431,88 @@ pub struct Comparison {
     pub strict: bool,
 }
 
-/// Separa `lhs <op> rhs` si el texto contiene un operador de comparación.
-fn split_comparison(src: &str) -> Option<(&str, &str, Comparison)> {
-    let ops: [(&str, bool, bool); 6] = [
+impl Comparison {
+    /// ¿Se cumple `lhs <op> rhs`, dado `v = lhs - rhs`?
+    #[inline]
+    pub fn holds(self, v: f64) -> bool {
+        match (self.less, self.strict) {
+            (true, true) => v < 0.0,
+            (true, false) => v <= 0.0,
+            (false, true) => v > 0.0,
+            (false, false) => v >= 0.0,
+        }
+    }
+}
+
+/// Divide `a < b <= c …` en los operandos y las comparaciones entre ellos.
+fn split_comparisons(src: &str) -> (Vec<&str>, Vec<Comparison>) {
+    const OPS: [(&str, bool, bool); 6] = [
         ("<=", true, false), (">=", false, false), ("≤", true, false), ("≥", false, false), ("<", true, true), (">", false, true),
     ];
-    let (pos, op, less, strict) = ops
-        .iter()
-        .filter_map(|&(op, less, strict)| src.find(op).map(|p| (p, op, less, strict)))
-        // El primero en el texto; ante empate ("<=" vs "<") gana el más largo.
-        .min_by_key(|&(p, op, ..)| (p, usize::MAX - op.len()))?;
-    Some((&src[..pos], &src[pos + op.len()..], Comparison { less, strict }))
+    let mut parts = Vec::new();
+    let mut cmps = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < src.len() {
+        // Ante "<=" y "<" en la misma posición gana el más largo (está antes en OPS).
+        if let Some(&(op, less, strict)) = OPS.iter().find(|(op, ..)| src[i..].starts_with(op)) {
+            parts.push(&src[start..i]);
+            cmps.push(Comparison { less, strict });
+            i += op.len();
+            start = i;
+        } else {
+            i += src[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    parts.push(&src[start..]);
+    (parts, cmps)
+}
+
+/// Separa `expr {cond; cond} {cond}` en la expresión y las condiciones (como texto).
+fn split_restrictions(src: &str) -> Result<(&str, Vec<&str>), MathError> {
+    let Some(open) = src.find('{') else {
+        if src.contains('}') {
+            return err("'}' sin '{'");
+        }
+        return Ok((src, Vec::new()));
+    };
+    let mut conds = Vec::new();
+    let mut rest = &src[open..];
+    while let Some(after) = rest.strip_prefix('{') {
+        let Some(close) = after.find('}') else { return err("falta '}'") };
+        let inner = &after[..close];
+        if inner.contains('{') {
+            return err("llaves anidadas");
+        }
+        conds.extend(inner.split(';').map(str::trim).filter(|c| !c.is_empty()));
+        rest = after[close + 1..].trim_start();
+    }
+    if !rest.is_empty() {
+        return err("después de las restricciones '{…}' no puede haber más texto");
+    }
+    if conds.is_empty() {
+        return err("restricción vacía");
+    }
+    Ok((&src[..open], conds))
+}
+
+fn parse_restrictions(conds: &[&str], user_funcs: &HashSet<String>, user_names: &HashSet<String>) -> Result<Vec<Restriction>, MathError> {
+    let mut out = Vec::new();
+    for c in conds {
+        let (parts, cmps) = split_comparisons(c);
+        if cmps.is_empty() {
+            return err(format!("la restricción '{c}' necesita <, >, ≤ o ≥"));
+        }
+        if c.contains('=') && !c.contains("<=") && !c.contains(">=") {
+            return err("en las restricciones usa <, >, <= o >=");
+        }
+        let exprs = parts.iter().map(|p| parse_expr(p, user_funcs, user_names)).collect::<Result<Vec<_>, _>>()?;
+        // a < x < b  →  a < x  y  x < b
+        for (k, cmp) in cmps.into_iter().enumerate() {
+            out.push(Restriction { lhs: exprs[k].clone(), rhs: exprs[k + 1].clone(), cmp });
+        }
+    }
+    Ok(out)
 }
 
 /// Primera pasada sobre el texto: detecta qué nombres se definen en `nombre = …`
@@ -453,14 +534,37 @@ pub fn scan_definition(src: &str) -> Option<(String, bool)> {
     Some((name.to_string(), is_func))
 }
 
-pub fn parse_statement(src: &str, user_funcs: &HashSet<String>, user_names: &HashSet<String>) -> Result<Statement, MathError> {
-    if let Some((l, r, cmp)) = split_comparison(src) {
-        if r.contains(['<', '>', '≤', '≥', '=']) {
-            return err("solo se admite una comparación por línea");
+/// Parsea una línea completa. Devuelve la sentencia y sus restricciones `{…}`; en las
+/// definiciones de funciones las restricciones pasan a formar parte del cuerpo.
+pub fn parse_statement(
+    src: &str,
+    user_funcs: &HashSet<String>,
+    user_names: &HashSet<String>,
+) -> Result<(Statement, Vec<Restriction>), MathError> {
+    let (main, conds) = split_restrictions(src)?;
+    let restrictions = parse_restrictions(&conds, user_funcs, user_names)?;
+    let st = parse_main(main, user_funcs, user_names)?;
+    Ok(match st {
+        Statement::FuncDef { name, params, body } if !restrictions.is_empty() => {
+            (Statement::FuncDef { name, params, body: Expr::Restrict(Box::new(body), restrictions) }, Vec::new())
         }
-        let lhs = parse_expr(l, user_funcs, user_names)?;
-        let rhs = parse_expr(r, user_funcs, user_names)?;
-        return Ok(Statement::Inequality { lhs, rhs, cmp });
+        st => (st, restrictions),
+    })
+}
+
+fn parse_main(src: &str, user_funcs: &HashSet<String>, user_names: &HashSet<String>) -> Result<Statement, MathError> {
+    let (parts, cmps) = split_comparisons(src);
+    match cmps.len() {
+        0 => {}
+        1 => {
+            if parts[1].contains('=') {
+                return err("una desigualdad no puede llevar además '='");
+            }
+            let lhs = parse_expr(parts[0], user_funcs, user_names)?;
+            let rhs = parse_expr(parts[1], user_funcs, user_names)?;
+            return Ok(Statement::Inequality { lhs, rhs, cmp: cmps[0] });
+        }
+        _ => return err("solo se admite una comparación por línea (usa {…} para restringir)"),
     }
     let parts: Vec<&str> = src.split('=').collect();
     match parts.len() {
@@ -498,6 +602,29 @@ pub enum Compiled {
     Neg(Box<Compiled>),
     F1(Func1, Box<Compiled>),
     F2(Func2, Box<Compiled>, Box<Compiled>),
+    /// `value` si se cumplen las condiciones (cada una como `lhs - rhs`), si no NaN.
+    /// `sub` indica en qué punto se evalúan las condiciones.
+    Cond { value: Box<Compiled>, conds: Vec<(Compiled, Comparison)>, sub: CondPoint },
+}
+
+/// Punto en el que se comprueban las condiciones de `Compiled::Cond`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CondPoint {
+    /// En (x, y) tal cual.
+    Xy,
+    /// El valor es la y de la curva: se comprueba en (x, valor). Para y = f(x).
+    ValueIsY,
+    /// El valor es la x de la curva: se comprueba en (valor, y). Para x = g(y).
+    ValueIsX,
+}
+
+/// Envuelve `value` con condiciones (si las hay).
+pub fn restrict(value: Compiled, conds: Vec<(Compiled, Comparison)>, sub: CondPoint) -> Compiled {
+    if conds.is_empty() { value } else { Compiled::Cond { value: Box::new(value), conds, sub } }
+}
+
+pub fn conds_hold(conds: &[(Compiled, Comparison)], x: f64, y: f64) -> bool {
+    conds.iter().all(|(c, cmp)| cmp.holds(c.eval(x, y)))
 }
 
 impl Compiled {
@@ -510,6 +637,15 @@ impl Compiled {
             Compiled::Neg(a) => -a.eval(x, y),
             Compiled::F1(f, a) => apply1(*f, a.eval(x, y)),
             Compiled::F2(f, a, b) => apply2(*f, a.eval(x, y), b.eval(x, y)),
+            Compiled::Cond { value, conds, sub } => {
+                let v = value.eval(x, y);
+                let (px, py) = match sub {
+                    CondPoint::Xy => (x, y),
+                    CondPoint::ValueIsY => (x, v),
+                    CondPoint::ValueIsX => (v, y),
+                };
+                if conds_hold(conds, px, py) { v } else { f64::NAN }
+            }
         }
     }
 
@@ -526,6 +662,7 @@ impl Compiled {
             || match self {
                 Compiled::Neg(a) | Compiled::F1(_, a) => a.any(pred),
                 Compiled::F2(_, a, b) => a.any(pred) || b.any(pred),
+                Compiled::Cond { value, conds, .. } => value.any(pred) || conds.iter().any(|(c, _)| c.any(pred)),
                 _ => false,
             }
     }
@@ -667,6 +804,18 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
             compile_scoped(body, env, &inner, depth + 1)?
         }
         Expr::Tuple(_) => return err("los puntos (a, b) solo pueden ir solos en una línea"),
+        Expr::Restrict(body, rs) => {
+            let value = compile_scoped(body, env, locals, depth)?;
+            let conds = rs
+                .iter()
+                .map(|r| {
+                    let l = compile_scoped(&r.lhs, env, locals, depth)?;
+                    let rr = compile_scoped(&r.rhs, env, locals, depth)?;
+                    Ok((fold(Compiled::F2(Func2::Sub, Box::new(l), Box::new(rr))), r.cmp))
+                })
+                .collect::<Result<Vec<_>, MathError>>()?;
+            restrict(value, conds, CondPoint::Xy)
+        }
     };
     Ok(fold(c))
 }
@@ -712,7 +861,7 @@ mod tests {
     fn inequalities() {
         let none = HashSet::new();
         for (src, less, strict) in [("y < x^2", true, true), ("y >= 2", false, false), ("x^2+y^2 ≤ 4", true, false), ("y>x", false, true)] {
-            let Statement::Inequality { cmp, .. } = parse_statement(src, &none, &none).unwrap() else { panic!("{src}") };
+            let (Statement::Inequality { cmp, .. }, _) = parse_statement(src, &none, &none).unwrap() else { panic!("{src}") };
             assert_eq!(cmp, Comparison { less, strict }, "{src}");
         }
         assert!(parse_statement("1 < x < 3", &none, &none).is_err());
@@ -724,11 +873,59 @@ mod tests {
         let names: HashSet<String> = ["f".to_string(), "a".to_string()].into();
         let mut env = Env::default();
         env.constants.insert("a".into(), 2.0);
-        let Statement::FuncDef { name, params, body } = parse_statement("f(t) = a t^2", &funcs, &names).unwrap() else {
+        let (Statement::FuncDef { name, params, body }, _) = parse_statement("f(t) = a t^2", &funcs, &names).unwrap() else {
             panic!()
         };
         env.funcs.insert(name, (params, body));
         let e = parse_expr("f(x+1)", &funcs, &names).unwrap();
         assert_eq!(compile(&e, &env).unwrap().eval(1.0, 0.0), 8.0);
+    }
+
+    #[test]
+    fn restrictions() {
+        let none = HashSet::new();
+        let (st, rs) = parse_statement("y = x^2 {x > 2 ; y < 12}", &none, &none).unwrap();
+        assert!(matches!(st, Statement::Equation { .. }));
+        assert_eq!(rs.len(), 2);
+        // Varios grupos y desigualdad doble.
+        let (_, rs) = parse_statement("y = x {-1 <= x < 3}{y > 0}", &none, &none).unwrap();
+        assert_eq!(rs.len(), 3);
+        assert_eq!(rs[0].cmp, Comparison { less: true, strict: false });
+        assert!(parse_statement("y = x {x > 1", &none, &none).is_err());
+        assert!(parse_statement("y = x {x}", &none, &none).is_err());
+        assert!(parse_statement("y = x {x>1} + 2", &none, &none).is_err());
+
+        // y = x^2 restringida a x > 2, y < 12 (evaluada como curva y = f(x)).
+        let env = Env::default();
+        let e = parse_expr("x^2", &none, &none).unwrap();
+        let conds = rs_compiled(&["x > 2", "y < 12"], &env);
+        let f = restrict(compile(&e, &env).unwrap(), conds, CondPoint::ValueIsY);
+        assert!(f.eval(1.0, 0.0).is_nan());
+        assert_eq!(f.eval(3.0, 0.0), 9.0);
+        assert!(f.eval(3.5, 0.0).is_nan()); // 12.25 > 12
+
+        // Restricción dentro de una función: f(t) = t {t > 0}.
+        let funcs: HashSet<String> = ["f".to_string()].into();
+        let (Statement::FuncDef { name, params, body }, rest) = parse_statement("f(t) = t {t > 0}", &funcs, &funcs).unwrap() else {
+            panic!()
+        };
+        assert!(rest.is_empty());
+        let mut env = Env::default();
+        env.funcs.insert(name, (params, body));
+        let c = compile(&parse_expr("f(x - 1)", &funcs, &funcs).unwrap(), &env).unwrap();
+        assert!(c.eval(0.5, 0.0).is_nan());
+        assert_eq!(c.eval(3.0, 0.0), 2.0);
+    }
+
+    fn rs_compiled(srcs: &[&str], env: &Env) -> Vec<(Compiled, Comparison)> {
+        let none = HashSet::new();
+        srcs.iter()
+            .flat_map(|s| parse_restrictions(&[s], &none, &none).unwrap())
+            .map(|r| {
+                let l = compile(&r.lhs, env).unwrap();
+                let rr = compile(&r.rhs, env).unwrap();
+                (Compiled::F2(Func2::Sub, Box::new(l), Box::new(rr)), r.cmp)
+            })
+            .collect()
     }
 }

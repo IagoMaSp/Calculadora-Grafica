@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use eframe::egui::{Align2, Color32, ColorImage, FontId, Mesh, Painter, Pos2, Rect, Stroke, pos2};
 
-use crate::math::Compiled;
+use crate::math::{self, CondPoint, Compiled};
 
 /// Vista del plano: centro en coordenadas del mundo y escala en píxeles por unidad.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -221,6 +221,12 @@ fn run_tracer<F: Fn(f64) -> f64, S: Fn(f64, f64) -> Pos2>(tr: &mut Tracer<'_, F,
 /// Los segmentos se encadenan en polilíneas para poder dibujarlas con guiones.
 pub fn trace_implicit(f: &Compiled, view: &View, rect: Rect) -> Vec<Polyline> {
     const CELL: f32 = 4.0;
+    // Con restricciones: la rejilla usa la función sin restringir y luego se recorta
+    // cada segmento justo en el borde de la región permitida.
+    let (f, conds) = match f {
+        Compiled::Cond { value, conds, sub: CondPoint::Xy } => (&**value, Some(conds.as_slice())),
+        _ => (f, None),
+    };
     let nx = (rect.width() / CELL).ceil() as usize + 1;
     let ny = (rect.height() / CELL).ceil() as usize + 1;
     let world = |i: usize, j: usize| view.to_world(rect, pos2(rect.left() + i as f32 * CELL, rect.top() + j as f32 * CELL));
@@ -279,7 +285,36 @@ pub fn trace_implicit(f: &Compiled, view: &View, rect: Rect) -> Vec<Polyline> {
             }
         }
     }
+    if let Some(conds) = conds {
+        let keep = |p: Pos2| {
+            let (x, y) = view.to_world(rect, p);
+            math::conds_hold(conds, x, y)
+        };
+        segs = segs.into_iter().filter_map(|s| clip_segment(s, &keep)).collect();
+    }
     chain_segments(segs)
+}
+
+/// Recorta un segmento a la parte donde `keep` es cierto (se supone un solo cruce).
+fn clip_segment([a, b]: [Pos2; 2], keep: &impl Fn(Pos2) -> bool) -> Option<[Pos2; 2]> {
+    let (ka, kb) = (keep(a), keep(b));
+    if ka && kb {
+        return Some([a, b]);
+    }
+    if !ka && !kb {
+        return None;
+    }
+    // Bisección entre el extremo que vale y el que no.
+    let (mut inside, mut outside) = if ka { (a, b) } else { (b, a) };
+    for _ in 0..16 {
+        let m = inside.lerp(outside, 0.5);
+        if keep(m) {
+            inside = m;
+        } else {
+            outside = m;
+        }
+    }
+    Some(if ka { [a, inside] } else { [inside, b] })
 }
 
 /// Une segmentos que comparten extremos en polilíneas lo más largas posible.

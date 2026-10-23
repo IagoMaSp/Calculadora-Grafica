@@ -8,7 +8,7 @@ use eframe::egui::{
 };
 
 use crate::analysis::{self, Curve, Poi};
-use crate::math::{self, Compiled, Env, Expr, MathError, Statement};
+use crate::math::{self, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::style::{self, EditorTarget, LineStyle, Style};
 
@@ -35,7 +35,9 @@ enum Kind {
     Curve(Curve),
     /// Desigualdad: región a un lado de `curve`. Para y = f(x), `positive` es "por encima";
     /// para x = g(y), "a la derecha"; para F(x, y) = 0, la región F > 0.
-    Ineq { curve: Curve, positive: bool, strict: bool },
+    /// `mask`: si existe, la región se pinta como {mask > 0} (o < 0) en vez de rellenar
+    /// hasta el borde (curvas implícitas y desigualdades con restricciones).
+    Ineq { curve: Curve, positive: bool, strict: bool, mask: Option<Compiled> },
     Point(f64, f64),
 }
 
@@ -214,7 +216,7 @@ impl GraphApp {
         }
 
         // 2) Parseo de cada línea.
-        let parsed: Vec<Option<Result<Statement, MathError>>> = self
+        let parsed: Vec<Option<Result<(Statement, Vec<Restriction>), MathError>>> = self
             .items
             .iter()
             .map(|it| {
@@ -229,13 +231,13 @@ impl GraphApp {
         let mut seen: HashMap<String, usize> = HashMap::new();
         for (i, p) in parsed.iter().enumerate() {
             let name = match p {
-                Some(Ok(Statement::FuncDef { name, .. })) | Some(Ok(Statement::Constant { name, .. })) => name,
+                Some(Ok((Statement::FuncDef { name, .. }, _))) | Some(Ok((Statement::Constant { name, .. }, _))) => name,
                 _ => continue,
             };
             if seen.insert(name.clone(), i).is_some() {
                 dup.insert(i);
             }
-            if let Some(Ok(Statement::FuncDef { name, params, body })) = p {
+            if let Some(Ok((Statement::FuncDef { name, params, body }, _))) = p {
                 if !dup.contains(&i) {
                     env.funcs.insert(name.clone(), (params.clone(), body.clone()));
                 }
@@ -245,7 +247,7 @@ impl GraphApp {
         loop {
             let mut progress = false;
             for (i, p) in parsed.iter().enumerate() {
-                let Some(Ok(Statement::Constant { name, expr })) = p else { continue };
+                let Some(Ok((Statement::Constant { name, expr }, _))) = p else { continue };
                 if dup.contains(&i) || matches!(const_results.get(&i), Some(Ok(_))) {
                     continue;
                 }
@@ -274,7 +276,7 @@ impl GraphApp {
                 None => Kind::Empty,
                 Some(Err(e)) => Kind::Error(e.0),
                 Some(Ok(_)) if dup.contains(&i) => Kind::Error("nombre ya definido en otra línea".into()),
-                Some(Ok(st)) => classify(st, &env, const_results.remove(&i)).unwrap_or_else(|e| Kind::Error(e.0)),
+                Some(Ok((st, rs))) => classify(st, &rs, &env, const_results.remove(&i)).unwrap_or_else(|e| Kind::Error(e.0)),
             };
             kinds.push(kind);
         }
@@ -606,17 +608,16 @@ impl GraphApp {
             .enumerate()
             .map(|(i, k)| match k {
                 Kind::Curve(c) => Geometry { lines: lines_of(c), ..Default::default() },
-                Kind::Ineq { curve, positive, .. } => {
-                    let region = match curve {
-                        Curve::Implicit(f) => {
-                            let mask = plot::region_mask(f, *positive, &view, rect);
-                            Some(ctx.load_texture(format!("region-{i}"), mask, TextureOptions::LINEAR))
-                        }
-                        _ => None,
-                    };
+                Kind::Ineq { curve, positive, mask, .. } => {
+                    let region = mask.as_ref().map(|f| {
+                        let img = plot::region_mask(f, *positive, &view, rect);
+                        ctx.load_texture(format!("region-{i}"), img, TextureOptions::LINEAR)
+                    });
                     Geometry { lines: lines_of(curve), region, point: None }
                 }
-                Kind::Point(x, y) => Geometry { point: Some(view.to_screen(rect, *x, *y)), ..Default::default() },
+                Kind::Point(x, y) if x.is_finite() && y.is_finite() => {
+                    Geometry { point: Some(view.to_screen(rect, *x, *y)), ..Default::default() }
+                }
                 _ => Geometry::default(),
             })
             .collect();
@@ -672,6 +673,12 @@ impl GraphApp {
                 continue;
             }
             let fill = item.style.fill_color(dark);
+            if let Some(tex) = &g.region {
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                let size = tex.size_vec2() * 3.0;
+                painter.image(tex.id(), Rect::from_min_size(rect.min, size), uv, fill);
+                continue;
+            }
             match curve {
                 Curve::Fx(_) => {
                     let edge_y = if *positive { rect.top() } else { rect.bottom() };
@@ -681,13 +688,7 @@ impl GraphApp {
                     let edge_x = if *positive { rect.right() } else { rect.left() };
                     painter.add(plot::fill_to_edge(&g.lines, fill, |p| pos2(edge_x, p.y)));
                 }
-                Curve::Implicit(_) => {
-                    if let Some(tex) = &g.region {
-                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                        let size = tex.size_vec2() * 3.0;
-                        painter.image(tex.id(), Rect::from_min_size(rect.min, size), uv, fill);
-                    }
-                }
+                Curve::Implicit(_) => {}
             }
         }
 
@@ -811,16 +812,38 @@ fn draw_tooltip(painter: &egui::Painter, rect: Rect, p: Pos2, text: String, acce
     painter.galley(r.min + vec2(5.0, 5.0), galley, text_color);
 }
 
-/// Decide qué es una sentencia ya parseada.
-fn classify(st: Statement, env: &Env, const_result: Option<Result<f64, MathError>>) -> Result<Kind, MathError> {
+/// Decide qué es una sentencia ya parseada. `restrictions` son las condiciones `{…}`.
+fn classify(
+    st: Statement,
+    restrictions: &[Restriction],
+    env: &Env,
+    const_result: Option<Result<f64, MathError>>,
+) -> Result<Kind, MathError> {
     let is_y = |c: &Compiled| matches!(c, Compiled::Y);
     let is_x = |c: &Compiled| matches!(c, Compiled::X);
+    let conds = restrictions
+        .iter()
+        .map(|r| Ok((implicit_any(math::compile(&r.lhs, env)?, math::compile(&r.rhs, env)?), r.cmp)))
+        .collect::<Result<Vec<_>, MathError>>()?;
+    let restricted = !conds.is_empty();
+    let not_graph = || Err(MathError("las restricciones {…} solo se aplican a gráficas".into()));
+    // Aplica las restricciones a la curva, comprobándolas en el punto de la curva.
+    let restrict_curve = |c: Curve| match c {
+        Curve::Fx(f) => Curve::Fx(math::restrict(f, conds.clone(), CondPoint::ValueIsY)),
+        Curve::Fy(g) => Curve::Fy(math::restrict(g, conds.clone(), CondPoint::ValueIsX)),
+        Curve::Implicit(f) => Curve::Implicit(math::restrict(f, conds.clone(), CondPoint::Xy)),
+    };
+
     Ok(match st {
         Statement::Constant { name, expr } => {
+            if restricted {
+                return not_graph();
+            }
             let value = const_result.unwrap_or_else(|| Err(MathError("no se pudo evaluar".into())))?;
             let is_literal = matches!(&expr, Expr::Num(_)) || matches!(&expr, Expr::Neg(inner) if matches!(**inner, Expr::Num(_)));
             if is_literal { Kind::Slider { name, value } } else { Kind::Value(value) }
         }
+        // Las restricciones de una función ya forman parte de su cuerpo.
         Statement::FuncDef { name, params, .. } => {
             if params.len() == 1 {
                 let call = Expr::Call(name, vec![Expr::Var("x".into())]);
@@ -839,13 +862,13 @@ fn classify(st: Statement, env: &Env, const_result: Option<Result<f64, MathError
         Statement::Equation { lhs, rhs } => {
             let l = math::compile(&lhs, env)?;
             let r = math::compile(&rhs, env)?;
-            Kind::Curve(match (l, r) {
+            Kind::Curve(restrict_curve(match (l, r) {
                 (l, r) if is_y(&l) && !r.uses_y() => Curve::Fx(r),
                 (l, r) if is_y(&r) && !l.uses_y() => Curve::Fx(l),
                 (l, r) if is_x(&l) && !r.uses_x() => Curve::Fy(r),
                 (l, r) if is_x(&r) && !l.uses_x() => Curve::Fy(l),
                 (l, r) => Curve::Implicit(implicit(l, r)?),
-            })
+            }))
         }
         Statement::Inequality { lhs, rhs, cmp } => {
             let l = math::compile(&lhs, env)?;
@@ -858,7 +881,15 @@ fn classify(st: Statement, env: &Env, const_result: Option<Result<f64, MathError
                 (l, r) if is_x(&r) && !l.uses_x() => (Curve::Fy(l), cmp.less),
                 (l, r) => (Curve::Implicit(implicit(l, r)?), !cmp.less),
             };
-            Kind::Ineq { curve, positive, strict: cmp.strict }
+            // La región explícita se rellena hasta el borde; con restricciones (o si es
+            // implícita) se pinta punto a punto como {F > 0} o {F < 0}.
+            let mask = match &curve {
+                Curve::Implicit(f) => Some(math::restrict(f.clone(), conds.clone(), CondPoint::Xy)),
+                Curve::Fx(f) if restricted => Some(math::restrict(implicit_any(Compiled::Y, f.clone()), conds.clone(), CondPoint::Xy)),
+                Curve::Fy(g) if restricted => Some(math::restrict(implicit_any(Compiled::X, g.clone()), conds.clone(), CondPoint::Xy)),
+                _ => None,
+            };
+            Kind::Ineq { curve: restrict_curve(curve), positive, strict: cmp.strict, mask }
         }
         Statement::Bare(Expr::Tuple(items)) => {
             if items.len() != 2 {
@@ -869,16 +900,28 @@ fn classify(st: Statement, env: &Env, const_result: Option<Result<f64, MathError
             if x.uses_x() || x.uses_y() || y.uses_x() || y.uses_y() {
                 return Err(MathError("las coordenadas no pueden depender de x ni y".into()));
             }
-            Kind::Point(x.eval(0.0, 0.0), y.eval(0.0, 0.0))
+            let (px, py) = (x.eval(0.0, 0.0), y.eval(0.0, 0.0));
+            // Con restricciones, el punto solo se muestra si las cumple.
+            if math::conds_hold(&conds, px, py) { Kind::Point(px, py) } else { Kind::Point(f64::NAN, f64::NAN) }
         }
         Statement::Bare(e) => {
             let c = math::compile(&e, env)?;
             if c.uses_y() {
                 return Err(MathError("usa una ecuación (con '=') para expresiones con y".into()));
             }
-            if c.uses_x() { Kind::Curve(Curve::Fx(c)) } else { Kind::Value(c.eval(0.0, 0.0)) }
+            // "3 {x > 0}" es una gráfica (y = 3 restringida), no un valor.
+            if c.uses_x() || restricted {
+                Kind::Curve(restrict_curve(Curve::Fx(c)))
+            } else {
+                Kind::Value(c.eval(0.0, 0.0))
+            }
         }
     })
+}
+
+/// lhs - rhs, sin comprobaciones.
+fn implicit_any(l: Compiled, r: Compiled) -> Compiled {
+    Compiled::F2(math::Func2::Sub, Box::new(l), Box::new(r))
 }
 
 /// F = lhs - rhs, que debe depender de x o de y.
@@ -913,6 +956,8 @@ fn help_ui(ui: &mut egui::Ui) {
         ("x^2 + y^2 = 4", "curva implícita"),
         ("y < 2x + 1", "desigualdad (región)"),
         ("x^2 + y^2 ≤ 9", "región implícita"),
+        ("y = x^2 {x > 2; y < 12}", "restringir la gráfica"),
+        ("y = x {-1 < x < 3}", "restricción doble"),
         ("a = 2", "deslizador"),
         ("f(x) = a x^3", "función con nombre"),
         ("f(x - 1)", "usar una función"),
