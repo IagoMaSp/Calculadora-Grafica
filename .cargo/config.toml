@@ -1,0 +1,4 @@
+# Windows: enlazar la biblioteca de C de forma estática para que el .exe funcione
+# sin tener que instalar el "Visual C++ Redistributable".
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

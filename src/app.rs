@@ -765,10 +765,7 @@ impl GraphApp {
                 ui.add_space(4.0);
             }
 
-            ui.add_space(8.0);
-            if ui.button("❓ Guía de uso").clicked() {
-                self.help_open = true;
-            }
+
         });
 
         if let Some(idx) = add_after {

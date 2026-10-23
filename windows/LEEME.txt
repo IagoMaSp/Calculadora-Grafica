@@ -1,0 +1,35 @@
+AppGrafica - calculadora gráfica
+================================
+
+CÓMO ABRIRLA
+------------
+1. Descomprime el .zip (clic derecho > "Extraer todo...").
+2. Haz doble clic en AppGrafica.exe. No hace falta instalar nada.
+
+La primera vez, Windows puede mostrar "Windows protegió su PC".
+Es normal: aparece con cualquier programa nuevo que no está firmado.
+Pulsa "Más información" y después "Ejecutar de todas formas".
+
+Consejo: si la vas a usar a menudo, clic derecho sobre AppGrafica.exe >
+"Mostrar más opciones" > "Enviar a" > "Escritorio (crear acceso directo)".
+
+CÓMO SE USA
+-----------
+- Escribe expresiones en el panel de la izquierda: se dibujan al momento.
+  Prueba:   y = sin(x)      x^2 + y^2 = 9      y < x^2      a = 1
+- Enter crea una línea nueva; la X la borra.
+- Arrastra el fondo para moverte y usa la rueda del ratón para hacer zoom.
+- Haz clic en una curva para ver sus cortes, máximos, mínimos e
+  intersecciones.
+- El círculo de color de cada expresión cambia su color, trazo y grosor.
+- Botón ? (arriba a la izquierda): guía completa con ejemplos.
+  Botón de engranaje: tema claro/oscuro y tamaño del texto.
+
+Todo lo que escribas se guarda solo al cerrar la aplicación.
+
+SI ALGO FALLA
+-------------
+- Si no se abre o se ve en negro, actualiza los drivers de la tarjeta
+  gráfica. La app intenta usar OpenGL automáticamente si el modo
+  principal no funciona.
+- Si encuentras un error, apunta qué escribiste y mándame una captura.
