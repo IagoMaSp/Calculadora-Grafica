@@ -8,6 +8,7 @@ mod keyboard;
 mod math;
 mod plot;
 mod points;
+mod pretty;
 mod special;
 mod style;
 

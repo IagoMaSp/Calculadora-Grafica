@@ -13,6 +13,7 @@ use crate::keyboard::{self, KeyboardState};
 use crate::math::{self, C64, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::points::{self, Coord, ListValue, Lists};
+use crate::pretty;
 use crate::style::{self, EditorTarget, LineStyle, Style};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -223,11 +224,13 @@ struct Settings {
     /// Tamaño de los números de los ejes.
     label_size: f32,
     show_pois: bool,
+    /// Mostrar las expresiones con escritura matemática (exponentes arriba, fracciones…).
+    pretty_math: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: ThemeChoice::Light, expr_size: 19.0, monospace: false, label_size: 13.0, show_pois: true }
+        Self { theme: ThemeChoice::Light, expr_size: 19.0, monospace: false, label_size: 13.0, show_pois: true, pretty_math: true }
     }
 }
 
@@ -248,6 +251,9 @@ pub struct GraphApp {
     revision: u64,
     #[serde(skip)]
     kinds: Vec<Kind>,
+    /// Escritura matemática de cada línea (si se pudo leer).
+    #[serde(skip)]
+    pretty: Vec<Option<pretty::Node>>,
     #[serde(skip)]
     analyzed_revision: Option<u64>,
     #[serde(skip)]
@@ -288,6 +294,7 @@ impl Default for GraphApp {
             settings: Settings::default(),
             revision: 1,
             kinds: Vec::new(),
+            pretty: Vec::new(),
             analyzed_revision: None,
             geometry: None,
             pois: None,
@@ -396,6 +403,14 @@ impl GraphApp {
             .map(|it| {
                 let t = it.text.trim();
                 (!t.is_empty()).then(|| math::parse_statement(t, &user_funcs, &user_names))
+            })
+            .collect();
+
+        self.pretty = parsed
+            .iter()
+            .map(|p| match p {
+                Some(Ok((st, rs))) => Some(pretty::statement(st, rs)),
+                _ => None,
             })
             .collect();
 
@@ -857,9 +872,20 @@ impl GraphApp {
                         if ui.button(RichText::new("✕").size(self.settings.expr_size * 0.7)).on_hover_text("Eliminar").clicked() {
                             remove = Some(idx);
                         }
+                        // Escritura matemática salvo mientras se edita (clic para editar).
+                        let edit_id = expr_edit_id(item.id);
+                        let editing = ui.memory(|m| m.has_focus(edit_id)) || self.focus_next == Some(item.id);
+                        let node = self.pretty.get(idx).and_then(Option::as_ref);
+                        if let (true, false, Some(node)) = (self.settings.pretty_math && !item.text.trim().is_empty(), editing, node) {
+                            if math_view(ui, node, self.settings.expr_size).clicked() {
+                                self.focus_next = Some(item.id);
+                                self.selected = Some(item.id);
+                            }
+                            return;
+                        }
                         let resp = ui.add(
                             TextEdit::singleline(&mut item.text)
-                                .id(expr_edit_id(item.id))
+                                .id(edit_id)
                                 .desired_width(ui.available_width())
                                 .font(font.clone())
                                 .margin(vec2(6.0, 4.0))
@@ -1021,6 +1047,7 @@ impl GraphApp {
         ui.checkbox(&mut self.settings.monospace, "Fuente monoespaciada");
         ui.add(egui::Slider::new(&mut self.settings.label_size, 9.0..=24.0).step_by(1.0).text("Números de los ejes"));
         ui.checkbox(&mut self.settings.show_pois, "Puntos notables al seleccionar una curva");
+        ui.checkbox(&mut self.settings.pretty_math, "Escritura matemática (exponentes, fracciones…)");
         ui.add_space(4.0);
         if ui.button("Restablecer ajustes").clicked() {
             self.settings = Settings::default();
@@ -1667,6 +1694,31 @@ fn point_extras_ui(ui: &mut egui::Ui, item: &mut Item, name: Option<&str>, singl
         }
     }
     changed
+}
+
+/// Expresión con escritura matemática, en un recuadro como el del campo de texto.
+/// Si no cabe a lo ancho, se reduce (hasta el 60 %).
+fn math_view(ui: &mut egui::Ui, node: &pretty::Node, size: f32) -> egui::Response {
+    let color = ui.visuals().strong_text_color();
+    let painter = ui.painter().clone();
+    let composer = pretty::Composer { painter: &painter, color };
+    let pad = vec2(6.0, 5.0);
+    let avail = ui.available_width();
+    let mut layout = composer.layout(node, size);
+    if layout.w > avail - 2.0 * pad.x {
+        let scale = ((avail - 2.0 * pad.x) / layout.w).max(0.6);
+        layout = composer.layout(node, size * scale);
+    }
+    let h = (layout.height() + 2.0 * pad.y).max(size * 1.3 + 8.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(avail, h), Sense::click());
+    let visuals = ui.visuals();
+    ui.painter().rect_filled(rect, 4.0, visuals.text_edit_bg_color());
+    if resp.hovered() {
+        ui.painter().rect_stroke(rect, 4.0, visuals.widgets.hovered.bg_stroke, egui::StrokeKind::Inside);
+    }
+    let baseline = rect.center().y + (layout.asc - layout.desc) / 2.0;
+    layout.paint(&ui.painter_at(rect.shrink(1.0)), pos2(rect.left() + pad.x, baseline), color);
+    resp.on_hover_cursor(egui::CursorIcon::Text)
 }
 
 /// ¿`name` es una variable sin definir (candidata a deslizador)?

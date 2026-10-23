@@ -172,6 +172,32 @@ const CONSTANTS: &[(&str, f64)] = &[
     ("inf", f64::INFINITY),
 ];
 
+/// Nombre con el que se muestra una función de un argumento.
+pub fn func1_display(f: Func1) -> &'static str {
+    match f {
+        Func1::Asin => "arcsin",
+        Func1::Acos => "arccos",
+        Func1::Atan => "arctan",
+        Func1::Asec => "arcsec",
+        Func1::Acsc => "arccsc",
+        Func1::Acot => "arccot",
+        Func1::Asinh => "arsinh",
+        Func1::Acosh => "arcosh",
+        Func1::Atanh => "artanh",
+        Func1::Gamma => "Γ",
+        Func1::LnGamma => "ln Γ",
+        Func1::LambertW => "W",
+        Func1::Fact => "!",
+        Func1::CAbs => "abs",
+        _ => FUNC1_NAMES.iter().find(|(_, g)| *g == f).map_or("?", |(n, _)| n),
+    }
+}
+
+/// Nombre con el que se muestra una función de dos argumentos.
+pub fn func2_display(f: Func2) -> &'static str {
+    FUNC2_NAMES.iter().find(|(_, g)| *g == f).map_or("?", |(n, _)| n)
+}
+
 /// Funciones con sintaxis propia (no van en las tablas de arriba).
 const SPECIAL_FUNCS: &[&str] = &["sum", "prod", "int", "integral", "deriv", "diff"];
 
@@ -617,7 +643,9 @@ pub fn parse_expr(src: &str, user_funcs: &HashSet<String>, user_names: &HashSet<
     match p.peek() {
         None => Ok(e),
         Some(Tok::Op(')')) => err("paréntesis ')' de más"),
-        Some(t) => err(format!("no se esperaba {t:?}")),
+        Some(Tok::Op(c)) => err(format!("no se esperaba '{c}' aquí")),
+        Some(Tok::Num(v)) => err(format!("no se esperaba el número {v} aquí")),
+        Some(Tok::Ident(n)) => err(format!("no se esperaba '{n}' aquí")),
     }
 }
 
