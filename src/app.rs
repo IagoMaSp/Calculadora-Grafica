@@ -19,8 +19,79 @@ struct Item {
     #[serde(default)]
     style: Style,
     visible: bool,
-    /// Rango del deslizador, si la línea es `a = número`.
-    slider: Option<(f64, f64)>,
+    /// Configuración del deslizador, si la línea es `a = número`.
+    #[serde(default)]
+    slider: SliderCfg,
+    /// Rango del parámetro (t o θ) de una curva paramétrica o polar.
+    #[serde(default)]
+    domain: Option<(f64, f64)>,
+    #[serde(skip)]
+    anim: AnimState,
+    /// ¿Se muestran los ajustes del deslizador (rango, paso, velocidad)?
+    #[serde(skip)]
+    slider_open: bool,
+}
+
+/// Rango por defecto de t y θ.
+const DEFAULT_DOMAIN: (f64, f64) = (0.0, std::f64::consts::TAU);
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
+enum AnimMode {
+    /// Al llegar al máximo vuelve al mínimo.
+    Loop,
+    /// Va y vuelve entre mínimo y máximo.
+    Bounce,
+    /// Se detiene al llegar al máximo.
+    Once,
+}
+
+const SPEEDS: [f64; 5] = [0.25, 0.5, 1.0, 1.5, 2.0];
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
+#[serde(default)]
+struct SliderCfg {
+    min: f64,
+    max: f64,
+    /// Incremento del deslizador; 0 = continuo.
+    step: f64,
+    speed: f64,
+    mode: AnimMode,
+}
+
+impl Default for SliderCfg {
+    fn default() -> Self {
+        Self { min: -10.0, max: 10.0, step: 0.0, speed: 1.0, mode: AnimMode::Loop }
+    }
+}
+
+impl SliderCfg {
+    /// Ajusta `v` al paso (contando desde el mínimo) y al rango.
+    fn snap(&self, v: f64) -> f64 {
+        let v = v.clamp(self.min, self.max);
+        if self.step > 0.0 {
+            let k = ((v - self.min) / self.step).round();
+            (self.min + k * self.step).min(self.max)
+        } else {
+            v
+        }
+    }
+
+    /// Texto del valor sin ruido de coma flotante (0.30000000004 → 0.3).
+    fn format(&self, v: f64) -> String {
+        let decimals = if self.step > 0.0 { (-self.step.log10()).ceil().clamp(0.0, 10.0) as i32 + 1 } else { 4 };
+        let m = 10f64.powi(decimals);
+        format_number((v * m).round() / m)
+    }
+}
+
+/// Estado de reproducción de un deslizador (no se guarda).
+#[derive(Clone, Copy, Default)]
+struct AnimState {
+    playing: bool,
+    /// Posición continua de la animación (el valor mostrado es esta posición ajustada al paso).
+    pos: Option<f64>,
+    /// Sentido en el modo rebote: true = hacia atrás.
+    backwards: bool,
 }
 
 /// Interpretación de una línea, recalculada cuando cambia algún texto.
@@ -86,14 +157,12 @@ struct Settings {
     monospace: bool,
     /// Tamaño de los números de los ejes.
     label_size: f32,
-    /// Escala general de la interfaz.
-    ui_scale: f32,
     show_pois: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: ThemeChoice::Light, expr_size: 19.0, monospace: false, label_size: 13.0, ui_scale: 1.0, show_pois: true }
+        Self { theme: ThemeChoice::Light, expr_size: 19.0, monospace: false, label_size: 13.0, show_pois: true }
     }
 }
 
@@ -177,14 +246,25 @@ impl GraphApp {
         if app.items.is_empty() {
             app.push_item("");
         }
-        cc.egui_ctx.set_zoom_factor(app.settings.ui_scale);
+        // Sin escalado de interfaz (ni con Ctrl +/-): la app siempre a escala 1.
+        cc.egui_ctx.set_zoom_factor(1.0);
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         app
     }
 
     fn new_item(&mut self, text: &str) -> Item {
         let id = self.next_id;
         self.next_id += 1;
-        Item { id, text: text.into(), style: Style::with_palette(id as usize), visible: true, slider: None }
+        Item {
+            id,
+            text: text.into(),
+            style: Style::with_palette(id as usize),
+            visible: true,
+            slider: SliderCfg::default(),
+            domain: None,
+            anim: AnimState::default(),
+            slider_open: false,
+        }
     }
 
     fn push_item(&mut self, text: &str) -> u64 {
@@ -276,27 +356,88 @@ impl GraphApp {
                 None => Kind::Empty,
                 Some(Err(e)) => Kind::Error(e.0),
                 Some(Ok(_)) if dup.contains(&i) => Kind::Error("nombre ya definido en otra línea".into()),
-                Some(Ok((st, rs))) => classify(st, &rs, &env, const_results.remove(&i)).unwrap_or_else(|e| Kind::Error(e.0)),
+                Some(Ok((st, rs))) => {
+                    let domain = self.items[i].domain.unwrap_or(DEFAULT_DOMAIN);
+                    classify(st, &rs, &env, const_results.remove(&i), domain).unwrap_or_else(|e| Kind::Error(e.0))
+                }
             };
             kinds.push(kind);
         }
 
-        // Deslizadores: crear/ajustar rango.
+        // Deslizadores: si el valor escrito cae fuera del rango, se amplía el rango.
         for (it, k) in self.items.iter_mut().zip(&kinds) {
             if let Kind::Slider { value, .. } = k {
-                let (lo, hi) = it.slider.unwrap_or((-10.0, 10.0));
-                let (lo, hi) = if *value < lo || *value > hi {
-                    let m = value.abs().max(1.0) * 2.0;
-                    (lo.min(-m), hi.max(m))
-                } else {
-                    (lo, hi)
-                };
-                it.slider = Some((lo, hi));
+                it.slider.min = it.slider.min.min(*value);
+                it.slider.max = it.slider.max.max(*value);
             } else {
-                it.slider = None;
+                it.anim = AnimState::default();
             }
         }
         self.kinds = kinds;
+    }
+
+    /// Avanza los deslizadores que se están reproduciendo.
+    fn animate(&mut self, ctx: &egui::Context) {
+        let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
+        let mut playing = false;
+        let mut changed = false;
+        for (item, kind) in self.items.iter_mut().zip(&self.kinds) {
+            let Kind::Slider { name, value } = kind else { continue };
+            if !item.anim.playing {
+                continue;
+            }
+            playing = true;
+            let cfg = item.slider;
+            let span = cfg.max - cfg.min;
+            if span <= 0.0 {
+                continue;
+            }
+            // Si el valor cambió por otra vía (texto, arrastre), seguir desde ahí.
+            let tol = if cfg.step > 0.0 { cfg.step * 0.51 } else { span * 1e-3 };
+            let mut pos = match item.anim.pos {
+                Some(p) if (cfg.snap(p) - value).abs() <= tol => p,
+                _ => *value,
+            };
+            // A velocidad 1× se recorre el rango completo en 8 segundos.
+            let delta = span / 8.0 * cfg.speed * dt;
+            match cfg.mode {
+                AnimMode::Loop => {
+                    pos += delta;
+                    if pos > cfg.max {
+                        pos = cfg.min + (pos - cfg.max) % span;
+                    }
+                }
+                AnimMode::Bounce => {
+                    pos += if item.anim.backwards { -delta } else { delta };
+                    if pos > cfg.max {
+                        pos = cfg.max - (pos - cfg.max);
+                        item.anim.backwards = true;
+                    } else if pos < cfg.min {
+                        pos = cfg.min + (cfg.min - pos);
+                        item.anim.backwards = false;
+                    }
+                }
+                AnimMode::Once => {
+                    pos += delta;
+                    if pos >= cfg.max {
+                        pos = cfg.max;
+                        item.anim.playing = false;
+                    }
+                }
+            }
+            item.anim.pos = Some(pos);
+            let v = cfg.snap(pos);
+            if (v - value).abs() > 1e-12 * span {
+                item.text = format!("{name} = {}", cfg.format(v));
+                changed = true;
+            }
+        }
+        if changed {
+            self.revision += 1;
+        }
+        if playing {
+            ctx.request_repaint();
+        }
     }
 
     // ───────────────────────── Panel de expresiones ─────────────────────────
@@ -424,13 +565,15 @@ impl GraphApp {
                         });
                     }
                     Kind::Slider { name, value } => {
-                        let (lo, hi) = item.slider.unwrap_or((-10.0, 10.0));
-                        let mut v = *value;
                         ui.indent(item.id, |ui| {
-                            ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(60.0);
-                            let resp = ui.add(egui::Slider::new(&mut v, lo..=hi).smart_aim(true));
-                            if resp.changed() {
-                                item.text = format!("{name} = {}", format_number(v));
+                            if slider_ui(ui, item, name, *value) {
+                                changed = true;
+                            }
+                        });
+                    }
+                    Kind::Curve(Curve::Param { var, .. }) | Kind::Ineq { curve: Curve::Param { var, .. }, .. } => {
+                        ui.indent(item.id, |ui| {
+                            if domain_ui(ui, item, var) {
                                 changed = true;
                             }
                         });
@@ -480,16 +623,10 @@ impl GraphApp {
         ui.add(egui::Slider::new(&mut self.settings.expr_size, 12.0..=36.0).step_by(1.0).text("Texto de expresiones"));
         ui.checkbox(&mut self.settings.monospace, "Fuente monoespaciada");
         ui.add(egui::Slider::new(&mut self.settings.label_size, 9.0..=24.0).step_by(1.0).text("Números de los ejes"));
-        let mut scale = ui.ctx().zoom_factor();
-        if ui.add(egui::Slider::new(&mut scale, 0.6..=2.5).step_by(0.05).text("Escala de la interfaz")).changed() {
-            ui.ctx().set_zoom_factor(scale);
-        }
-        self.settings.ui_scale = scale;
         ui.checkbox(&mut self.settings.show_pois, "Puntos notables al seleccionar una curva");
         ui.add_space(4.0);
         if ui.button("Restablecer ajustes").clicked() {
             self.settings = Settings::default();
-            ui.ctx().set_zoom_factor(1.0);
         }
     }
 
@@ -601,6 +738,7 @@ impl GraphApp {
             Curve::Fx(f) => plot::trace_fx(f, &view, rect),
             Curve::Fy(g) => plot::trace_fy(g, &view, rect),
             Curve::Implicit(f) => plot::trace_implicit(f, &view, rect),
+            Curve::Param { x, y, t0, t1, .. } => plot::trace_param(x, y, *t0, *t1, &view, rect),
         };
         let geo = self
             .kinds
@@ -688,7 +826,8 @@ impl GraphApp {
                     let edge_x = if *positive { rect.right() } else { rect.left() };
                     painter.add(plot::fill_to_edge(&g.lines, fill, |p| pos2(edge_x, p.y)));
                 }
-                Curve::Implicit(_) => {}
+                // Siempre tienen máscara.
+                Curve::Implicit(_) | Curve::Param { .. } => {}
             }
         }
 
@@ -759,7 +898,7 @@ impl GraphApp {
             let candidate = match (kind, kind.curve()) {
                 (_, Some(Curve::Fx(f))) => Some((mx, f.eval(mx, 0.0))),
                 (_, Some(Curve::Fy(g))) => Some((g.eval(0.0, my), my)),
-                (_, Some(Curve::Implicit(_))) => geo
+                (_, Some(Curve::Implicit(_) | Curve::Param { .. })) => geo
                     .and_then(|g| g.get(idx))
                     .and_then(|g| g.lines.iter().flatten().min_by(|a, b| a.distance(mouse).total_cmp(&b.distance(mouse))))
                     .map(|p| self.view.to_world(rect, *p)),
@@ -796,6 +935,121 @@ impl GraphApp {
     }
 }
 
+/// Deslizador con reproducción y sus ajustes. Devuelve si cambió el texto o el rango.
+fn slider_ui(ui: &mut egui::Ui, item: &mut Item, name: &str, value: f64) -> bool {
+    let mut changed = false;
+    let cfg = &mut item.slider;
+    ui.horizontal(|ui| {
+        let play = if item.anim.playing { "⏸" } else { "▶" };
+        let tip = if item.anim.playing { "Pausar" } else { "Animar" };
+        if ui.add(egui::Button::new(RichText::new(play).size(15.0)).min_size(vec2(30.0, 24.0))).on_hover_text(tip).clicked() {
+            item.anim.playing = !item.anim.playing;
+            // Al empezar desde el final en modo bucle/una vez, arrancar desde el mínimo.
+            if item.anim.playing && cfg.mode != AnimMode::Bounce && value >= cfg.max {
+                item.anim.pos = Some(cfg.min);
+            }
+        }
+        let gear = ui.add(egui::Button::new("⚙").selected(item.slider_open)).on_hover_text("Rango, paso y velocidad");
+        if gear.clicked() {
+            item.slider_open = !item.slider_open;
+        }
+
+        let mut v = value;
+        ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(60.0);
+        let mut slider = egui::Slider::new(&mut v, cfg.min..=cfg.max).custom_formatter(|v, _| cfg.format(v));
+        slider = if cfg.step > 0.0 { slider.step_by(cfg.step) } else { slider.smart_aim(true) };
+        if ui.add(slider).changed() {
+            let v = cfg.snap(v);
+            item.text = format!("{name} = {}", cfg.format(v));
+            item.anim.pos = None;
+            changed = true;
+        }
+    });
+
+    if item.slider_open {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::Grid::new(("slider-cfg", item.id)).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                let drag_speed = ((cfg.max - cfg.min).abs() / 200.0).max(1e-3);
+                ui.label("Rango");
+                ui.horizontal(|ui| {
+                    changed |= ui.add(egui::DragValue::new(&mut cfg.min).speed(drag_speed)).changed();
+                    ui.label(format!("≤ {name} ≤"));
+                    changed |= ui.add(egui::DragValue::new(&mut cfg.max).speed(drag_speed)).changed();
+                });
+                ui.end_row();
+
+                ui.label("Paso");
+                ui.horizontal(|ui| {
+                    changed |= ui.add(egui::DragValue::new(&mut cfg.step).speed(0.01).range(0.0..=f64::MAX)).changed();
+                    for s in [0.01, 0.1, 1.0] {
+                        if ui.selectable_label(cfg.step == s, format_number(s)).clicked() {
+                            cfg.step = s;
+                            changed = true;
+                        }
+                    }
+                    if ui.selectable_label(cfg.step == 0.0, "libre").on_hover_text("Sin paso: valores continuos").clicked() {
+                        cfg.step = 0.0;
+                        changed = true;
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Velocidad");
+                ui.horizontal(|ui| {
+                    for sp in SPEEDS {
+                        ui.selectable_value(&mut cfg.speed, sp, format!("{}×", format_number(sp)));
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Modo");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut cfg.mode, AnimMode::Loop, "↻ Bucle").on_hover_text("Al llegar al máximo vuelve al mínimo");
+                    ui.selectable_value(&mut cfg.mode, AnimMode::Bounce, "⇄ Rebote").on_hover_text("Va y vuelve");
+                    ui.selectable_value(&mut cfg.mode, AnimMode::Once, "→ Una vez").on_hover_text("Se detiene en el máximo");
+                });
+                ui.end_row();
+            });
+        });
+        if cfg.max <= cfg.min {
+            cfg.max = cfg.min + if cfg.step > 0.0 { cfg.step } else { 1.0 };
+        }
+        // Si el rango o el paso dejan el valor fuera, se ajusta.
+        let snapped = cfg.snap(value);
+        if changed && snapped != value {
+            item.text = format!("{name} = {}", cfg.format(snapped));
+            item.anim.pos = None;
+        }
+    }
+    changed
+}
+
+/// Rango del parámetro de una curva paramétrica o polar. Devuelve si cambió.
+fn domain_ui(ui: &mut egui::Ui, item: &mut Item, var: &str) -> bool {
+    let (mut t0, mut t1) = item.domain.unwrap_or(DEFAULT_DOMAIN);
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let speed = ((t1 - t0).abs() / 200.0).max(1e-3);
+        changed |= ui.add(egui::DragValue::new(&mut t0).speed(speed)).changed();
+        ui.label(format!("≤ {var} ≤"));
+        changed |= ui.add(egui::DragValue::new(&mut t1).speed(speed)).changed();
+        for (label, k) in [("π", 1.0), ("2π", 2.0), ("12π", 12.0)] {
+            let target = (0.0, k * std::f64::consts::PI);
+            if ui.selectable_label((t0, t1) == target, format!("0–{label}")).clicked() {
+                (t0, t1) = target;
+                changed = true;
+            }
+        }
+    });
+    if changed {
+        if t1 <= t0 {
+            t1 = t0 + 1.0;
+        }
+        item.domain = Some((t0, t1));
+    }
+    changed
+}
+
 fn draw_tooltip(painter: &egui::Painter, rect: Rect, p: Pos2, text: String, accent: Color32, dark: bool) {
     let text_color = if dark { Color32::from_gray(230) } else { Color32::from_gray(20) };
     let galley = painter.layout_no_wrap(text, FontId::proportional(14.0), text_color);
@@ -812,26 +1066,76 @@ fn draw_tooltip(painter: &egui::Painter, rect: Rect, p: Pos2, text: String, acce
     painter.galley(r.min + vec2(5.0, 5.0), galley, text_color);
 }
 
-/// Decide qué es una sentencia ya parseada. `restrictions` son las condiciones `{…}`.
+const T_ERROR: &str = "t solo se usa en curvas paramétricas: (x(t), y(t))";
+const POLAR_ERROR: &str = "θ y r solo se usan en ecuaciones polares, p. ej. r = 1 + cos(θ)";
+
+/// Decide qué es una sentencia ya parseada. `restrictions` son las condiciones `{…}`
+/// y `domain` el rango del parámetro si resulta ser una curva paramétrica o polar.
 fn classify(
     st: Statement,
     restrictions: &[Restriction],
     env: &Env,
     const_result: Option<Result<f64, MathError>>,
+    domain: (f64, f64),
 ) -> Result<Kind, MathError> {
     let is_y = |c: &Compiled| matches!(c, Compiled::Y);
     let is_x = |c: &Compiled| matches!(c, Compiled::X);
-    let conds = restrictions
+    let raw_conds = restrictions
         .iter()
         .map(|r| Ok((implicit_any(math::compile(&r.lhs, env)?, math::compile(&r.rhs, env)?), r.cmp)))
         .collect::<Result<Vec<_>, MathError>>()?;
-    let restricted = !conds.is_empty();
+    let restricted = !raw_conds.is_empty();
+    // Condiciones para curvas en x/y: r y θ se expresan en función de x e y.
+    let conds_xy = || -> Result<Vec<(Compiled, math::Comparison)>, MathError> {
+        if raw_conds.iter().any(|(c, _)| c.uses_t()) {
+            return Err(MathError(T_ERROR.into()));
+        }
+        Ok(raw_conds.iter().map(|(c, cmp)| (polar_xy(c), *cmp)).collect())
+    };
+    // Condiciones para curvas paramétricas: solo pueden depender del parámetro.
+    let conds_param = |var: &Compiled| -> Result<Vec<(Compiled, math::Comparison)>, MathError> {
+        raw_conds
+            .iter()
+            .map(|(c, cmp)| {
+                let other = c.uses_x() || c.uses_y() || c.uses_r() || if *var == Compiled::T { c.uses_theta() } else { c.uses_t() };
+                if other {
+                    let name = if *var == Compiled::T { "t" } else { "θ" };
+                    return Err(MathError(format!("en esta curva las restricciones solo pueden usar {name}")));
+                }
+                Ok((param_to_x(c, var), *cmp))
+            })
+            .collect()
+    };
     let not_graph = || Err(MathError("las restricciones {…} solo se aplican a gráficas".into()));
     // Aplica las restricciones a la curva, comprobándolas en el punto de la curva.
-    let restrict_curve = |c: Curve| match c {
-        Curve::Fx(f) => Curve::Fx(math::restrict(f, conds.clone(), CondPoint::ValueIsY)),
-        Curve::Fy(g) => Curve::Fy(math::restrict(g, conds.clone(), CondPoint::ValueIsX)),
-        Curve::Implicit(f) => Curve::Implicit(math::restrict(f, conds.clone(), CondPoint::Xy)),
+    let restrict_curve = |c: Curve, conds: Vec<(Compiled, math::Comparison)>| match c {
+        Curve::Fx(f) => Curve::Fx(math::restrict(f, conds, CondPoint::ValueIsY)),
+        Curve::Fy(g) => Curve::Fy(math::restrict(g, conds, CondPoint::ValueIsX)),
+        Curve::Implicit(f) => Curve::Implicit(math::restrict(f, conds, CondPoint::Xy)),
+        p @ Curve::Param { .. } => p,
+    };
+    // r = f(θ) como curva paramétrica en θ.
+    let polar_curve = |f: Compiled| -> Result<Curve, MathError> {
+        let conds = conds_param(&Compiled::Theta)?;
+        let x = Compiled::F2(math::Func2::Mul, Box::new(f.clone()), Box::new(Compiled::F1(math::Func1::Cos, Box::new(Compiled::Theta))));
+        let y = Compiled::F2(math::Func2::Mul, Box::new(f), Box::new(Compiled::F1(math::Func1::Sin, Box::new(Compiled::Theta))));
+        Ok(Curve::Param {
+            x: math::restrict(param_to_x(&x, &Compiled::Theta), conds.clone(), CondPoint::Xy),
+            y: math::restrict(param_to_x(&y, &Compiled::Theta), conds, CondPoint::Xy),
+            t0: domain.0,
+            t1: domain.1,
+            var: "θ",
+        })
+    };
+    let only_theta = |c: &Compiled| !(c.uses_x() || c.uses_y() || c.uses_r() || c.uses_t());
+    let check_free = |c: &Compiled| -> Result<(), MathError> {
+        if c.uses_t() {
+            Err(MathError(T_ERROR.into()))
+        } else if c.uses_theta() || c.uses_r() {
+            Err(MathError(POLAR_ERROR.into()))
+        } else {
+            Ok(())
+        }
     };
 
     Ok(match st {
@@ -851,6 +1155,7 @@ fn classify(
                 if c.uses_y() {
                     return Err(MathError("la función usa y".into()));
                 }
+                check_free(&c)?;
                 Kind::Curve(Curve::Fx(c))
             } else {
                 // Comprueba que el cuerpo compile con valores de prueba.
@@ -862,17 +1167,47 @@ fn classify(
         Statement::Equation { lhs, rhs } => {
             let l = math::compile(&lhs, env)?;
             let r = math::compile(&rhs, env)?;
-            Kind::Curve(restrict_curve(match (l, r) {
-                (l, r) if is_y(&l) && !r.uses_y() => Curve::Fx(r),
-                (l, r) if is_y(&r) && !l.uses_y() => Curve::Fx(l),
-                (l, r) if is_x(&l) && !r.uses_x() => Curve::Fy(r),
-                (l, r) if is_x(&r) && !l.uses_x() => Curve::Fy(l),
-                (l, r) => Curve::Implicit(implicit(l, r)?),
-            }))
+            if l.uses_t() || r.uses_t() {
+                return Err(MathError(T_ERROR.into()));
+            }
+            if matches!(l, Compiled::R) && only_theta(&r) {
+                return Ok(Kind::Curve(polar_curve(r)?));
+            }
+            if matches!(r, Compiled::R) && only_theta(&l) {
+                return Ok(Kind::Curve(polar_curve(l)?));
+            }
+            let (l, r) = (polar_xy(&l), polar_xy(&r));
+            Kind::Curve(restrict_curve(
+                match (l, r) {
+                    (l, r) if is_y(&l) && !r.uses_y() => Curve::Fx(r),
+                    (l, r) if is_y(&r) && !l.uses_y() => Curve::Fx(l),
+                    (l, r) if is_x(&l) && !r.uses_x() => Curve::Fy(r),
+                    (l, r) if is_x(&r) && !l.uses_x() => Curve::Fy(l),
+                    (l, r) => Curve::Implicit(implicit(l, r)?),
+                },
+                conds_xy()?,
+            ))
         }
         Statement::Inequality { lhs, rhs, cmp } => {
             let l = math::compile(&lhs, env)?;
             let r = math::compile(&rhs, env)?;
+            if l.uses_t() || r.uses_t() {
+                return Err(MathError(T_ERROR.into()));
+            }
+            // r < f(θ): borde polar y región {r - f(θ) < 0}.
+            let polar = if matches!(l, Compiled::R) && only_theta(&r) {
+                Some((r.clone(), !cmp.less))
+            } else if matches!(r, Compiled::R) && only_theta(&l) {
+                Some((l.clone(), cmp.less))
+            } else {
+                None
+            };
+            if let Some((f, positive)) = polar {
+                let mask = math::restrict(polar_xy(&implicit_any(Compiled::R, f.clone())), conds_xy()?, CondPoint::Xy);
+                return Ok(Kind::Ineq { curve: polar_curve(f)?, positive, strict: cmp.strict, mask: Some(mask) });
+            }
+            let (l, r) = (polar_xy(&l), polar_xy(&r));
+            let conds = conds_xy()?;
             // `positive`: región y > f(x), x > g(y) o F > 0 según el caso.
             let (curve, positive) = match (l, r) {
                 (l, r) if is_y(&l) && !r.uses_y() => (Curve::Fx(r), !cmp.less),
@@ -889,7 +1224,7 @@ fn classify(
                 Curve::Fy(g) if restricted => Some(math::restrict(implicit_any(Compiled::X, g.clone()), conds.clone(), CondPoint::Xy)),
                 _ => None,
             };
-            Kind::Ineq { curve: restrict_curve(curve), positive, strict: cmp.strict, mask }
+            Kind::Ineq { curve: restrict_curve(curve, conds), positive, strict: cmp.strict, mask }
         }
         Statement::Bare(Expr::Tuple(items)) => {
             if items.len() != 2 {
@@ -897,26 +1232,69 @@ fn classify(
             }
             let x = math::compile(&items[0], env)?;
             let y = math::compile(&items[1], env)?;
-            if x.uses_x() || x.uses_y() || y.uses_x() || y.uses_y() {
-                return Err(MathError("las coordenadas no pueden depender de x ni y".into()));
+            if [&x, &y].iter().any(|c| c.uses_x() || c.uses_y() || c.uses_r()) {
+                return Err(MathError("las coordenadas no pueden depender de x, y ni r (usa t para una paramétrica)".into()));
+            }
+            let uses_t = x.uses_t() || y.uses_t();
+            let uses_theta = x.uses_theta() || y.uses_theta();
+            if uses_t && uses_theta {
+                return Err(MathError("usa un solo parámetro: t o θ".into()));
+            }
+            if uses_t || uses_theta {
+                // Curva paramétrica (x(t), y(t)).
+                let (var, name) = if uses_t { (Compiled::T, "t") } else { (Compiled::Theta, "θ") };
+                let conds = conds_param(&var)?;
+                return Ok(Kind::Curve(Curve::Param {
+                    x: math::restrict(param_to_x(&x, &var), conds.clone(), CondPoint::Xy),
+                    y: math::restrict(param_to_x(&y, &var), conds, CondPoint::Xy),
+                    t0: domain.0,
+                    t1: domain.1,
+                    var: name,
+                }));
             }
             let (px, py) = (x.eval(0.0, 0.0), y.eval(0.0, 0.0));
             // Con restricciones, el punto solo se muestra si las cumple.
-            if math::conds_hold(&conds, px, py) { Kind::Point(px, py) } else { Kind::Point(f64::NAN, f64::NAN) }
+            if math::conds_hold(&conds_xy()?, px, py) { Kind::Point(px, py) } else { Kind::Point(f64::NAN, f64::NAN) }
         }
         Statement::Bare(e) => {
             let c = math::compile(&e, env)?;
             if c.uses_y() {
                 return Err(MathError("usa una ecuación (con '=') para expresiones con y".into()));
             }
+            check_free(&c)?;
             // "3 {x > 0}" es una gráfica (y = 3 restringida), no un valor.
             if c.uses_x() || restricted {
-                Kind::Curve(restrict_curve(Curve::Fx(c)))
+                Kind::Curve(restrict_curve(Curve::Fx(c), conds_xy()?))
             } else {
                 Kind::Value(c.eval(0.0, 0.0))
             }
         }
     })
+}
+
+/// Sustituye r y θ por sus expresiones en x e y (θ en [0, 2π)).
+fn polar_xy(c: &Compiled) -> Compiled {
+    use math::{Func1, Func2};
+    if !c.uses_r() && !c.uses_theta() {
+        return c.clone();
+    }
+    let sq = |v: Compiled| Compiled::F2(Func2::Mul, Box::new(v.clone()), Box::new(v));
+    let r = Compiled::F1(Func1::Sqrt, Box::new(Compiled::F2(Func2::Add, Box::new(sq(Compiled::X)), Box::new(sq(Compiled::Y)))));
+    let theta = Compiled::F2(
+        Func2::Mod,
+        Box::new(Compiled::F2(Func2::Atan2, Box::new(Compiled::Y), Box::new(Compiled::X))),
+        Box::new(Compiled::Num(std::f64::consts::TAU)),
+    );
+    c.subst(&|n| match n {
+        Compiled::R => Some(r.clone()),
+        Compiled::Theta => Some(theta.clone()),
+        _ => None,
+    })
+}
+
+/// Pone el parámetro (`T` o `Theta`) en el lugar de x, para evaluar con `eval(t, 0)`.
+fn param_to_x(c: &Compiled, var: &Compiled) -> Compiled {
+    c.subst(&|n| (n == var).then_some(Compiled::X))
 }
 
 /// lhs - rhs, sin comprobaciones.
@@ -958,6 +1336,9 @@ fn help_ui(ui: &mut egui::Ui) {
         ("x^2 + y^2 ≤ 9", "región implícita"),
         ("y = x^2 {x > 2; y < 12}", "restringir la gráfica"),
         ("y = x {-1 < x < 3}", "restricción doble"),
+        ("(cos(t), sin(2t))", "curva paramétrica"),
+        ("r = 1 + cos(θ)", "curva polar (θ o theta)"),
+        ("r < 2 + sin(3θ)", "región polar"),
         ("a = 2", "deslizador"),
         ("f(x) = a x^3", "función con nombre"),
         ("f(x - 1)", "usar una función"),
@@ -982,7 +1363,8 @@ fn help_ui(ui: &mut egui::Ui) {
     ui.label(
         RichText::new(
             "Arrastra para mover, rueda para hacer zoom. Haz clic en una curva para ver sus cortes, máximos, mínimos e \
-             intersecciones. Clic en el círculo de color: estilo y visibilidad.",
+             intersecciones. Clic en el círculo de color: estilo y visibilidad. Los deslizadores tienen \
+             ▶ para animarlos y ⚙ para cambiar rango, paso, velocidad y modo.",
         )
         .small(),
     );
@@ -991,6 +1373,8 @@ fn help_ui(ui: &mut egui::Ui) {
 impl eframe::App for GraphApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(&ui.ctx().clone());
+        self.analyze();
+        self.animate(&ui.ctx().clone());
         self.analyze();
 
         egui::Panel::left("expresiones")

@@ -215,6 +215,104 @@ fn run_tracer<F: Fn(f64) -> f64, S: Fn(f64, f64) -> Pos2>(tr: &mut Tracer<'_, F,
     tr.break_line();
 }
 
+// ───────────────────────────── Curvas paramétricas ─────────────────────────────
+
+/// Curva (x(t), y(t)) para t en [t0, t1]. `fx`/`fy` reciben t en el lugar de x.
+pub fn trace_param(fx: &Compiled, fy: &Compiled, t0: f64, t1: f64, view: &View, rect: Rect) -> Vec<Polyline> {
+    let point = |t: f64| {
+        let (x, y) = (fx.eval(t, 0.0), fy.eval(t, 0.0));
+        (x.is_finite() && y.is_finite()).then(|| view.to_screen(rect, x, y))
+    };
+    let mut tr = ParamTracer {
+        point: &point,
+        clip: &clamp_point(rect),
+        rect,
+        jump: rect.size().length() * 0.5,
+        lines: Vec::new(),
+        cur: Vec::new(),
+    };
+    const N: usize = 1000;
+    let mut prev_t = t0;
+    let mut prev = point(t0);
+    if let Some(p) = prev {
+        tr.push(p);
+    }
+    for i in 1..=N {
+        let t = t0 + (t1 - t0) * i as f64 / N as f64;
+        let p = point(t);
+        tr.segment(prev_t, prev, t, p, 12);
+        prev_t = t;
+        prev = p;
+    }
+    tr.flush();
+    tr.lines
+}
+
+struct ParamTracer<'a> {
+    point: &'a dyn Fn(f64) -> Option<Pos2>,
+    clip: &'a dyn Fn(Pos2) -> Pos2,
+    rect: Rect,
+    /// Distancia en pantalla a partir de la cual un salto se considera discontinuidad.
+    jump: f32,
+    lines: Vec<Polyline>,
+    cur: Polyline,
+}
+
+impl ParamTracer<'_> {
+    fn push(&mut self, p: Pos2) {
+        self.cur.push((self.clip)(p));
+    }
+
+    fn flush(&mut self) {
+        if self.cur.len() >= 2 {
+            self.lines.push(std::mem::take(&mut self.cur));
+        } else {
+            self.cur.clear();
+        }
+    }
+
+    /// Supone emitido el punto en t0; emite el tramo hasta t1 inclusive.
+    fn segment(&mut self, t0: f64, p0: Option<Pos2>, t1: f64, p1: Option<Pos2>, depth: u32) {
+        match (p0, p1) {
+            (None, None) => {
+                self.flush();
+                return;
+            }
+            (Some(a), Some(b)) => {
+                let r = self.rect;
+                let same_side_out = (a.x < r.left() && b.x < r.left())
+                    || (a.x > r.right() && b.x > r.right())
+                    || (a.y < r.top() && b.y < r.top())
+                    || (a.y > r.bottom() && b.y > r.bottom());
+                let d = a.distance(b);
+                if d <= 2.0 || same_side_out {
+                    self.push(b);
+                    return;
+                }
+                if depth == 0 {
+                    if d > self.jump {
+                        self.flush();
+                    }
+                    self.push(b);
+                    return;
+                }
+            }
+            (_, p1) if depth == 0 => {
+                match p1 {
+                    Some(b) => self.push(b),
+                    None => self.flush(),
+                }
+                return;
+            }
+            _ => {}
+        }
+        let tm = 0.5 * (t0 + t1);
+        let pm = (self.point)(tm);
+        self.segment(t0, p0, tm, pm, depth - 1);
+        self.segment(tm, pm, t1, p1, depth - 1);
+    }
+}
+
 // ───────────────────────────── Curvas implícitas ─────────────────────────────
 
 /// Curva F(x, y) = 0 mediante "marching squares" sobre una rejilla de píxeles.

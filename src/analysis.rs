@@ -16,7 +16,13 @@ pub enum Curve {
     Fy(Compiled),
     /// F(x, y) = 0
     Implicit(Compiled),
+    /// (x(t), y(t)) con t en [t0, t1]; `x` e `y` se evalúan con t en el lugar de x.
+    /// Las curvas polares r = f(θ) también se guardan así. `var` es "t" o "θ" (para la interfaz).
+    Param { x: Compiled, y: Compiled, t0: f64, t1: f64, var: &'static str },
 }
+
+/// Muestras para buscar raíces/extremos en el parámetro de una paramétrica.
+const PARAM_SAMPLES: usize = 1000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PoiKind {
@@ -211,6 +217,18 @@ pub fn curve_pois(c: &Curve, view: &View, rect: Rect, out: &mut Vec<Poi>) {
                 push(0.0, r, PoiKind::YIntercept);
             }
         }
+        Curve::Param { x, y, t0, t1, .. } => {
+            let (px, py) = (|t: f64| x.eval(t, 0.0), |t: f64| y.eval(t, 0.0));
+            for t in roots(&py, *t0, *t1, PARAM_SAMPLES) {
+                push(px(t), 0.0, PoiKind::XIntercept);
+            }
+            for t in roots(&px, *t0, *t1, PARAM_SAMPLES) {
+                push(0.0, py(t), PoiKind::YIntercept);
+            }
+            for (t, is_max) in extrema(&py, *t0, *t1, PARAM_SAMPLES) {
+                push(px(t), py(t), if is_max { PoiKind::Max } else { PoiKind::Min });
+            }
+        }
     }
 }
 
@@ -247,6 +265,25 @@ pub fn intersections(a: &Curve, b: &Curve, a_lines: &[Polyline], b_lines: &[Poly
         (Fy(g), Implicit(imp)) | (Implicit(imp), Fy(g)) => {
             for t in roots(&|t| imp.eval(g.eval(0.0, t), t), y0, y1, ny) {
                 push(g.eval(0.0, t), t);
+            }
+        }
+        (Param { .. }, Param { .. }) => {
+            for p in polyline_crossings(a_lines, b_lines) {
+                let (x, y) = view.to_world(rect, p);
+                push(x, y);
+            }
+        }
+        // Paramétrica contra explícita/implícita: raíces en t.
+        (Param { x, y, t0, t1, .. }, other) | (other, Param { x, y, t0, t1, .. }) => {
+            let (px, py) = (|t: f64| x.eval(t, 0.0), |t: f64| y.eval(t, 0.0));
+            let h: Box<dyn Fn(f64) -> f64> = match other {
+                Fx(f) => Box::new(move |t| py(t) - f.eval(px(t), 0.0)),
+                Fy(g) => Box::new(move |t| px(t) - g.eval(0.0, py(t))),
+                Implicit(imp) => Box::new(move |t| imp.eval(px(t), py(t))),
+                Param { .. } => unreachable!(),
+            };
+            for t in roots(&*h, *t0, *t1, PARAM_SAMPLES) {
+                push(px(t), py(t));
             }
         }
         (Implicit(f), Implicit(g)) => {

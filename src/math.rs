@@ -387,8 +387,11 @@ fn is_builtin_func(name: &str) -> bool {
     FUNC1_NAMES.iter().any(|(n, _)| *n == name) || FUNC2_NAMES.iter().any(|(n, _)| *n == name)
 }
 
+/// Variables reservadas además de x e y: parámetro `t`, ángulo `θ` y radio `r`.
+const RESERVED_VARS: &[&str] = &["t", "θ", "theta", "r"];
+
 fn is_builtin_name(name: &str) -> bool {
-    is_builtin_func(name) || CONSTANTS.iter().any(|(n, _)| *n == name)
+    is_builtin_func(name) || CONSTANTS.iter().any(|(n, _)| *n == name) || name == "theta"
 }
 
 pub fn parse_expr(src: &str, user_funcs: &HashSet<String>, user_names: &HashSet<String>) -> Result<Expr, MathError> {
@@ -528,7 +531,7 @@ pub fn scan_definition(src: &str) -> Option<(String, bool)> {
     let valid = !name.is_empty()
         && name.chars().next().is_some_and(|c| c.is_alphabetic())
         && name.chars().all(|c| c.is_alphanumeric() || c == '_');
-    if !valid || name == "x" || name == "y" || is_builtin_name(name) {
+    if !valid || name == "x" || name == "y" || RESERVED_VARS.contains(&name) || is_builtin_name(name) {
         return None;
     }
     Some((name.to_string(), is_func))
@@ -594,11 +597,17 @@ fn parse_main(src: &str, user_funcs: &HashSet<String>, user_names: &HashSet<Stri
 // ───────────────────────────── Compilación ─────────────────────────────
 
 /// Árbol listo para evaluar: solo depende de x e y.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Compiled {
     Num(f64),
     X,
     Y,
+    /// Parámetro `t` de una curva paramétrica (se sustituye antes de evaluar).
+    T,
+    /// Ángulo `θ` en coordenadas polares (se sustituye antes de evaluar).
+    Theta,
+    /// Radio `r` en coordenadas polares (se sustituye antes de evaluar).
+    R,
     Neg(Box<Compiled>),
     F1(Func1, Box<Compiled>),
     F2(Func2, Box<Compiled>, Box<Compiled>),
@@ -634,6 +643,7 @@ impl Compiled {
             Compiled::Num(v) => *v,
             Compiled::X => x,
             Compiled::Y => y,
+            Compiled::T | Compiled::Theta | Compiled::R => f64::NAN,
             Compiled::Neg(a) => -a.eval(x, y),
             Compiled::F1(f, a) => apply1(*f, a.eval(x, y)),
             Compiled::F2(f, a, b) => apply2(*f, a.eval(x, y), b.eval(x, y)),
@@ -657,6 +667,36 @@ impl Compiled {
         self.any(&|c| matches!(c, Compiled::Y))
     }
 
+    pub fn uses_t(&self) -> bool {
+        self.any(&|c| matches!(c, Compiled::T))
+    }
+
+    pub fn uses_theta(&self) -> bool {
+        self.any(&|c| matches!(c, Compiled::Theta))
+    }
+
+    pub fn uses_r(&self) -> bool {
+        self.any(&|c| matches!(c, Compiled::R))
+    }
+
+    /// Copia del árbol sustituyendo las hojas para las que `f` devuelve algo.
+    pub fn subst(&self, f: &dyn Fn(&Compiled) -> Option<Compiled>) -> Compiled {
+        if let Some(c) = f(self) {
+            return c;
+        }
+        let c = match self {
+            Compiled::Neg(a) => Compiled::Neg(Box::new(a.subst(f))),
+            Compiled::F1(op, a) => Compiled::F1(*op, Box::new(a.subst(f))),
+            Compiled::F2(op, a, b) => Compiled::F2(*op, Box::new(a.subst(f)), Box::new(b.subst(f))),
+            Compiled::Cond { value, conds, sub } => Compiled::Cond {
+                value: Box::new(value.subst(f)),
+                conds: conds.iter().map(|(c, cmp)| (c.subst(f), *cmp)).collect(),
+                sub: *sub,
+            },
+            other => other.clone(),
+        };
+        fold(c)
+    }
     fn any(&self, pred: &dyn Fn(&Compiled) -> bool) -> bool {
         pred(self)
             || match self {
@@ -775,6 +815,12 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
                 Compiled::X
             } else if name == "y" {
                 Compiled::Y
+            } else if name == "t" {
+                Compiled::T
+            } else if name == "θ" || name == "theta" {
+                Compiled::Theta
+            } else if name == "r" {
+                Compiled::R
             } else if let Some(v) = env.constants.get(name) {
                 Compiled::Num(*v)
             } else if env.funcs.contains_key(name) {
@@ -927,5 +973,21 @@ mod tests {
                 (Compiled::F2(Func2::Sub, Box::new(l), Box::new(rr)), r.cmp)
             })
             .collect()
+    }
+
+    #[test]
+    fn polar_and_param_vars() {
+        let none = HashSet::new();
+        let c = compile(&parse_expr("1 + cos(theta) + t r", &none, &none).unwrap(), &Env::default()).unwrap();
+        assert!(c.uses_theta() && c.uses_t() && c.uses_r());
+        // θ -> x: se evalúa como función de x.
+        let d = c.subst(&|c| match c {
+            Compiled::Theta => Some(Compiled::X),
+            Compiled::T | Compiled::R => Some(Compiled::Num(0.0)),
+            _ => None,
+        });
+        assert!((d.eval(0.0, 0.0) - 2.0).abs() < 1e-12);
+        assert!(scan_definition("r = 2").is_none());
+        assert!(scan_definition("t = 2").is_none());
     }
 }
