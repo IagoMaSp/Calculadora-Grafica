@@ -41,6 +41,8 @@ pub struct Style {
     pub fill_opacity: f32,
     pub point: PointStyle,
     pub point_size: f32,
+    /// Unir los puntos de una lista con líneas.
+    pub connect: bool,
 }
 
 impl Default for Style {
@@ -53,6 +55,7 @@ impl Default for Style {
             fill_opacity: 0.25,
             point: PointStyle::Filled,
             point_size: 5.0,
+            connect: false,
         }
     }
 }
@@ -122,6 +125,7 @@ pub struct EditorTarget {
     pub has_line: bool,
     pub has_fill: bool,
     pub is_point: bool,
+    pub is_list: bool,
 }
 
 /// Editor de estilo (se muestra dentro de un popup). Devuelve si algo cambió.
@@ -194,6 +198,17 @@ pub fn style_editor(ui: &mut egui::Ui, style: &mut Style, visible: &mut bool, ta
         });
         ui.add(egui::Slider::new(&mut style.point_size, 2.0..=15.0).text("Tamaño"));
         ui.add(egui::Slider::new(&mut style.opacity, 0.05..=1.0).text("Opacidad"));
+        if target.is_list {
+            ui.checkbox(&mut style.connect, "Unir los puntos con líneas");
+            if style.connect {
+                ui.horizontal(|ui| {
+                    for (ls, tip) in [(LineStyle::Solid, "Sólida"), (LineStyle::Dashed, "Segmentada"), (LineStyle::Dotted, "Punteada")] {
+                        ui.selectable_value(&mut style.line, ls, tip);
+                    }
+                });
+                ui.add(egui::Slider::new(&mut style.width, 0.5..=12.0).text("Grosor").step_by(0.5));
+            }
+        }
     }
 
     before != (*style, *visible)

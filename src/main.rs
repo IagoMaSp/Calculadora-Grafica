@@ -3,8 +3,10 @@
 
 mod analysis;
 mod app;
+mod help;
 mod math;
 mod plot;
+mod points;
 mod style;
 
 fn main() -> eframe::Result {

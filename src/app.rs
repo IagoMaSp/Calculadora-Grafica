@@ -8,8 +8,10 @@ use eframe::egui::{
 };
 
 use crate::analysis::{self, Curve, Poi};
+use crate::help;
 use crate::math::{self, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
+use crate::points::{self, Coord, ListValue, Lists};
 use crate::style::{self, EditorTarget, LineStyle, Style};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -27,10 +29,54 @@ struct Item {
     domain: Option<(f64, f64)>,
     #[serde(skip)]
     anim: AnimState,
+    /// Etiqueta de los puntos.
+    #[serde(default)]
+    label: Label,
+    /// Dejar rastro cuando el punto se mueve.
+    #[serde(default)]
+    trace: bool,
+    #[serde(skip)]
+    trail: Vec<(f64, f64)>,
+    /// Animación de dibujo de una curva paramétrica.
+    #[serde(skip)]
+    draw: DrawAnim,
     /// ¿Se muestran los ajustes del deslizador (rango, paso, velocidad)?
     #[serde(skip)]
     slider_open: bool,
 }
+
+/// Etiqueta de un punto.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[serde(default)]
+struct Label {
+    /// None = automático (se muestra si el punto tiene nombre).
+    show: Option<bool>,
+    /// Texto; vacío = el nombre del punto.
+    text: String,
+    /// Añadir las coordenadas al texto.
+    coords: bool,
+}
+
+/// Animación que va dibujando una curva paramétrica desde t0 hasta t1.
+#[derive(Clone, Copy)]
+struct DrawAnim {
+    /// Mientras está activa, la curva se dibuja solo hasta `progress`.
+    active: bool,
+    playing: bool,
+    /// Fracción del rango ya dibujada (0–1).
+    progress: f64,
+    speed: f64,
+    looping: bool,
+}
+
+impl Default for DrawAnim {
+    fn default() -> Self {
+        Self { active: false, playing: false, progress: 0.0, speed: 1.0, looping: false }
+    }
+}
+
+/// Máximo de puntos guardados en el rastro de un punto.
+const MAX_TRAIL: usize = 20_000;
 
 /// Rango por defecto de t y θ.
 const DEFAULT_DOMAIN: (f64, f64) = (0.0, std::f64::consts::TAU);
@@ -67,6 +113,9 @@ impl Default for SliderCfg {
 impl SliderCfg {
     /// Ajusta `v` al paso (contando desde el mínimo) y al rango.
     fn snap(&self, v: f64) -> f64 {
+        if !(self.min <= self.max) {
+            return v;
+        }
         let v = v.clamp(self.min, self.max);
         if self.step > 0.0 {
             let k = ((v - self.min) / self.step).round();
@@ -109,7 +158,11 @@ enum Kind {
     /// `mask`: si existe, la región se pinta como {mask > 0} (o < 0) en vez de rellenar
     /// hasta el borde (curvas implícitas y desigualdades con restricciones).
     Ineq { curve: Curve, positive: bool, strict: bool, mask: Option<Compiled> },
-    Point(f64, f64),
+    /// Uno o varios puntos. `name` si se definió como `A = (1, 2)`; `drag` indica qué
+    /// coordenadas se pueden arrastrar con el ratón; `list` si es una lista.
+    Points { pts: Vec<(f64, f64)>, name: Option<String>, drag: Option<[Coord; 2]>, list: bool },
+    /// Lista de números: `[1, 2, 3]`.
+    Numbers(Vec<f64>),
 }
 
 impl Kind {
@@ -121,7 +174,7 @@ impl Kind {
     }
 
     fn is_graph(&self) -> bool {
-        self.curve().is_some() || matches!(self, Kind::Point(..))
+        self.curve().is_some() || matches!(self, Kind::Points { .. })
     }
 }
 
@@ -131,7 +184,7 @@ struct Geometry {
     lines: Vec<Polyline>,
     /// Región sombreada de una desigualdad implícita (máscara blanca, se tiñe al dibujar).
     region: Option<TextureHandle>,
-    point: Option<Pos2>,
+    points: Vec<Pos2>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -196,6 +249,13 @@ pub struct GraphApp {
     focus_next: Option<u64>,
     #[serde(skip)]
     theme_applied: Option<ThemeChoice>,
+    /// Punto que se está arrastrando.
+    #[serde(skip)]
+    dragging: Option<u64>,
+    #[serde(skip)]
+    help_open: bool,
+    #[serde(skip)]
+    help_section: usize,
 }
 
 impl Default for GraphApp {
@@ -213,8 +273,11 @@ impl Default for GraphApp {
             selected: None,
             focus_next: None,
             theme_applied: None,
+            dragging: None,
+            help_open: false,
+            help_section: 0,
         };
-        for text in ["y = sin(x)", "a = 0.5", "y = a x^2 - 3", "x^2 + y^2 < 9", "(2, 1)"] {
+        for text in ["y = sin(x)", "a = 0.5", "y = a x^2 - 3", "x^2 + y^2 < 9", "A = (2, 1)"] {
             app.push_item(text);
         }
         app
@@ -263,6 +326,10 @@ impl GraphApp {
             slider: SliderCfg::default(),
             domain: None,
             anim: AnimState::default(),
+            label: Label::default(),
+            trace: false,
+            trail: Vec::new(),
+            draw: DrawAnim::default(),
             slider_open: false,
         }
     }
@@ -323,12 +390,54 @@ impl GraphApp {
                 }
             }
         }
+        // Puntos y listas con nombre (A = (1, 2), L = [1, 2, 3]) y deslizadores.
+        let is_list_def = |i: usize| {
+            matches!(&parsed[i], Some(Ok((Statement::Constant { expr, .. }, _))) if points::is_list_syntax(expr))
+        };
+        let mut sliders = HashSet::new();
+        for (i, p) in parsed.iter().enumerate() {
+            let Some(Ok((Statement::Constant { name, expr }, _))) = p else { continue };
+            if dup.contains(&i) {
+                continue;
+            }
+            if is_list_def(i) {
+                env.points.insert(name.clone());
+            } else if matches!(expr, Expr::Num(_)) || matches!(expr, Expr::Neg(e) if matches!(**e, Expr::Num(_))) {
+                sliders.insert(name.clone());
+            }
+        }
+        let mut lists = Lists::default();
+        let mut list_results: HashMap<usize, Result<ListValue, MathError>> = HashMap::new();
         let mut const_results: HashMap<usize, Result<f64, MathError>> = HashMap::new();
         loop {
             let mut progress = false;
             for (i, p) in parsed.iter().enumerate() {
                 let Some(Ok((Statement::Constant { name, expr }, _))) = p else { continue };
-                if dup.contains(&i) || matches!(const_results.get(&i), Some(Ok(_))) {
+                if dup.contains(&i) || matches!(const_results.get(&i), Some(Ok(_))) || matches!(list_results.get(&i), Some(Ok(_))) {
+                    continue;
+                }
+                if is_list_def(i) {
+                    let res = if points::is_pointish(expr, &lists) {
+                        points::eval_points(expr, &env, &lists).map(ListValue::Points)
+                    } else {
+                        points::eval_numbers(expr, &env, &lists).map(ListValue::Numbers)
+                    };
+                    match &res {
+                        Ok(ListValue::Points(pts)) => {
+                            if let [(x, y)] = pts.as_slice() {
+                                env.constants.insert(format!("{name}.x"), *x);
+                                env.constants.insert(format!("{name}.y"), *y);
+                            }
+                            lists.points.insert(name.clone(), pts.clone());
+                            progress = true;
+                        }
+                        Ok(ListValue::Numbers(v)) => {
+                            lists.numbers.insert(name.clone(), v.clone());
+                            progress = true;
+                        }
+                        Err(_) => {}
+                    }
+                    list_results.insert(i, res);
                     continue;
                 }
                 let res = math::compile(expr, &env).and_then(|c| {
@@ -357,11 +466,29 @@ impl GraphApp {
                 Some(Err(e)) => Kind::Error(e.0),
                 Some(Ok(_)) if dup.contains(&i) => Kind::Error("nombre ya definido en otra línea".into()),
                 Some(Ok((st, rs))) => {
-                    let domain = self.items[i].domain.unwrap_or(DEFAULT_DOMAIN);
-                    classify(st, &rs, &env, const_results.remove(&i), domain).unwrap_or_else(|e| Kind::Error(e.0))
+                    let it = &self.items[i];
+                    let (t0, t1) = it.domain.unwrap_or(DEFAULT_DOMAIN);
+                    // Durante la animación de dibujo, la curva llega solo hasta el progreso actual.
+                    let domain = if it.draw.active { (t0, t0 + (t1 - t0) * it.draw.progress.max(1e-9)) } else { (t0, t1) };
+                    let ctx = Ctx { env: &env, lists: &lists, sliders: &sliders, domain };
+                    classify(st, &rs, &ctx, const_results.remove(&i), list_results.remove(&i)).unwrap_or_else(|e| Kind::Error(e.0))
                 }
             };
             kinds.push(kind);
+        }
+
+        // Rastro de los puntos que se mueven.
+        for (it, k) in self.items.iter_mut().zip(&kinds) {
+            match k {
+                Kind::Points { pts, list: false, .. } if it.trace => {
+                    if let [(x, y)] = pts.as_slice() {
+                        if x.is_finite() && y.is_finite() && it.trail.last() != Some(&(*x, *y)) && it.trail.len() < MAX_TRAIL {
+                            it.trail.push((*x, *y));
+                        }
+                    }
+                }
+                _ => it.trail.clear(),
+            }
         }
 
         // Deslizadores: si el valor escrito cae fuera del rango, se amplía el rango.
@@ -432,6 +559,24 @@ impl GraphApp {
                 changed = true;
             }
         }
+        // Curvas paramétricas que se van dibujando: a 1× el recorrido completo dura 4 s.
+        for item in &mut self.items {
+            let d = &mut item.draw;
+            if !(d.active && d.playing) {
+                continue;
+            }
+            playing = true;
+            d.progress += dt * d.speed / 4.0;
+            if d.progress >= 1.0 {
+                if d.looping {
+                    d.progress = 0.0;
+                } else {
+                    d.progress = 1.0;
+                    d.playing = false;
+                }
+            }
+            changed = true;
+        }
         if changed {
             self.revision += 1;
         }
@@ -447,6 +592,9 @@ impl GraphApp {
         ui.horizontal(|ui| {
             ui.heading("Expresiones");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("❓").size(16.0)).on_hover_text("Guía de uso").clicked() {
+                    self.help_open = true;
+                }
                 let resp = ui.button(RichText::new("⚙").size(16.0)).on_hover_text("Ajustes");
                 egui::Popup::menu(&resp)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -501,7 +649,8 @@ impl GraphApp {
                         let target = EditorTarget {
                             has_line: kind.curve().is_some(),
                             has_fill: matches!(kind, Kind::Ineq { .. }),
-                            is_point: matches!(kind, Kind::Point(..)),
+                            is_point: matches!(kind, Kind::Points { .. }),
+                            is_list: matches!(kind, Kind::Points { list: true, .. }),
                         };
                         egui::Popup::from_toggle_button_response(&resp)
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -510,6 +659,9 @@ impl GraphApp {
                                 style::style_editor(ui, &mut item.style, &mut item.visible, &target);
                                 if was_visible != item.visible {
                                     changed = true;
+                                }
+                                if let Kind::Points { name, list, .. } = kind {
+                                    changed |= point_extras_ui(ui, item, name.as_deref(), !*list);
                                 }
                             });
                     }
@@ -571,9 +723,17 @@ impl GraphApp {
                             }
                         });
                     }
-                    Kind::Curve(Curve::Param { var, .. }) | Kind::Ineq { curve: Curve::Param { var, .. }, .. } => {
+                    Kind::Numbers(v) => {
+                        let shown: Vec<String> = v.iter().take(12).map(|x| format_number(*x)).collect();
+                        let more = if v.len() > 12 { format!(", … ({} elementos)", v.len()) } else { String::new() };
                         ui.indent(item.id, |ui| {
-                            if domain_ui(ui, item, var) {
+                            ui.label(RichText::new(format!("= [{}{more}]", shown.join(", "))).size(self.settings.expr_size * 0.8));
+                        });
+                    }
+                    Kind::Curve(Curve::Param { var, .. }) | Kind::Ineq { curve: Curve::Param { var, .. }, .. } => {
+                        let can_draw = matches!(kind, Kind::Curve(_));
+                        ui.indent(item.id, |ui| {
+                            if domain_ui(ui, item, var, can_draw) {
                                 changed = true;
                             }
                         });
@@ -584,7 +744,9 @@ impl GraphApp {
             }
 
             ui.add_space(8.0);
-            ui.collapsing("Ayuda", help_ui);
+            if ui.button("❓ Guía de uso").clicked() {
+                self.help_open = true;
+            }
         });
 
         if let Some(idx) = add_after {
@@ -650,11 +812,28 @@ impl GraphApp {
         let dark = ui.visuals().dark_mode;
         let painter = ui.painter_at(rect);
 
-        // Interacción: arrastrar = desplazar, rueda / pellizco = zoom.
-        if resp.dragged() {
+        // Interacción: arrastrar un punto móvil lo mueve; arrastrar el fondo desplaza la vista;
+        // rueda / pellizco = zoom.
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        if resp.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
+            self.dragging = origin.and_then(|p| self.draggable_under(rect, p));
+        }
+        if let Some(id) = self.dragging {
+            if let (true, Some(p)) = (resp.dragged(), pointer) {
+                self.drag_point_to(id, rect, p);
+                self.analyze();
+            }
+            if resp.drag_stopped() || !resp.dragged() {
+                self.dragging = None;
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if resp.dragged() {
             let d = resp.drag_delta();
             self.view.cx -= d.x as f64 / self.view.scale;
             self.view.cy += d.y as f64 / self.view.scale;
+        } else if pointer.is_some_and(|p| resp.hovered() && self.draggable_under(rect, p).is_some()) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
         if resp.hovered() {
             let (scroll, zoom, pointer) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
@@ -751,11 +930,12 @@ impl GraphApp {
                         let img = plot::region_mask(f, *positive, &view, rect);
                         ctx.load_texture(format!("region-{i}"), img, TextureOptions::LINEAR)
                     });
-                    Geometry { lines: lines_of(curve), region, point: None }
+                    Geometry { lines: lines_of(curve), region, points: Vec::new() }
                 }
-                Kind::Point(x, y) if x.is_finite() && y.is_finite() => {
-                    Geometry { point: Some(view.to_screen(rect, *x, *y)), ..Default::default() }
-                }
+                Kind::Points { pts, .. } => Geometry {
+                    points: pts.iter().filter(|(x, y)| x.is_finite() && y.is_finite()).map(|&(x, y)| view.to_screen(rect, x, y)).collect(),
+                    ..Default::default()
+                },
                 _ => Geometry::default(),
             })
             .collect();
@@ -854,10 +1034,34 @@ impl GraphApp {
             }
         }
 
-        // 3) Puntos.
-        for (item, g) in self.items.iter().zip(geo) {
-            if let (true, Some(p)) = (item.visible, g.point) {
-                style::draw_point(painter, p, &item.style, item.style.stroke_color(dark));
+        // 3) Rastros, líneas entre puntos, puntos y etiquetas.
+        for ((item, kind), g) in self.items.iter().zip(&self.kinds).zip(geo) {
+            if !item.visible {
+                continue;
+            }
+            let st = &item.style;
+            let color = st.stroke_color(dark);
+            if item.trail.len() >= 2 {
+                let trail: Vec<Pos2> = item.trail.iter().map(|&(x, y)| self.view.to_screen(rect, x, y)).collect();
+                style::draw_polyline(painter, &trail, LineStyle::Solid, color.gamma_multiply(0.7), (st.width * 0.8).max(1.5));
+            }
+            if st.connect && g.points.len() >= 2 {
+                style::draw_polyline(painter, &g.points, st.line, color, st.width);
+            }
+            for p in &g.points {
+                style::draw_point(painter, *p, st, color);
+            }
+            // Punta de una curva que se está dibujando.
+            if let (true, Kind::Curve(Curve::Param { x, y, t1, .. })) = (item.draw.active, kind) {
+                let (px, py) = (x.eval(*t1, 0.0), y.eval(*t1, 0.0));
+                if px.is_finite() && py.is_finite() {
+                    let p = self.view.to_screen(rect, px, py);
+                    painter.circle_filled(p, st.width + 3.5, st.base_color(dark));
+                    painter.circle_stroke(p, st.width + 3.5, Stroke::new(1.5, if dark { Color32::from_gray(24) } else { Color32::WHITE }));
+                }
+            }
+            if let Kind::Points { pts, name, list, .. } = kind {
+                self.draw_labels(painter, rect, item, pts, name.as_deref(), !*list, dark);
             }
         }
 
@@ -872,6 +1076,100 @@ impl GraphApp {
                 }
             }
         }
+    }
+
+    /// Etiquetas de los puntos. Por defecto solo se muestran en puntos sueltos con nombre.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_labels(&self, painter: &egui::Painter, rect: Rect, item: &Item, pts: &[(f64, f64)], name: Option<&str>, single: bool, dark: bool) {
+        if !item.label.show.unwrap_or(name.is_some() && single) {
+            return;
+        }
+        let base = if item.label.text.trim().is_empty() { name.unwrap_or("") } else { item.label.text.trim() };
+        let text_color = if dark { Color32::from_gray(235) } else { Color32::from_gray(25) };
+        let bg = if dark { Color32::from_black_alpha(150) } else { Color32::from_white_alpha(190) };
+        let font = FontId::proportional(self.settings.label_size + 3.0);
+        for &(x, y) in pts.iter().take(500) {
+            if !(x.is_finite() && y.is_finite()) {
+                continue;
+            }
+            let text = match (base.is_empty(), item.label.coords) {
+                (_, false) => base.to_string(),
+                (true, true) => format!("({}, {})", format_number(x), format_number(y)),
+                (false, true) => format!("{base} ({}, {})", format_number(x), format_number(y)),
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let p = self.view.to_screen(rect, x, y);
+            let galley = painter.layout_no_wrap(text, font.clone(), text_color);
+            let offset = item.style.point_size + 4.0;
+            let r = Rect::from_min_size(p + vec2(offset, -offset - galley.size().y), galley.size()).expand(2.0);
+            painter.rect_filled(r, 3.0, bg);
+            painter.galley(r.min + vec2(2.0, 2.0), galley, text_color);
+        }
+    }
+
+    /// Punto arrastrable bajo el cursor (a menos de 12 px).
+    fn draggable_under(&self, rect: Rect, mouse: Pos2) -> Option<u64> {
+        self.items
+            .iter()
+            .zip(&self.kinds)
+            .filter(|(it, _)| it.visible)
+            .filter_map(|(it, k)| match k {
+                Kind::Points { pts, drag: Some(_), .. } => {
+                    let &(x, y) = pts.first()?;
+                    let d = self.view.to_screen(rect, x, y).distance(mouse);
+                    (d < 12.0).then_some((d, it.id))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, id)| id)
+    }
+
+    /// Mueve el punto `id` a la posición del cursor: reescribe sus números o mueve los
+    /// deslizadores de sus coordenadas. Se ajusta a la cuadrícula si está cerca.
+    fn drag_point_to(&mut self, id: u64, rect: Rect, mouse: Pos2) {
+        let Some(idx) = self.items.iter().position(|it| it.id == id) else { return };
+        let Some(Kind::Points { drag: Some(spec), .. }) = self.kinds.get(idx) else { return };
+        let spec = spec.clone();
+        let (wx, wy) = self.view.to_world(rect, mouse);
+        let scale = self.view.scale;
+        let minor = plot::minor_step(&self.view, self.settings.label_size);
+        let precision = 10f64.powf((1.0 / scale).log10().floor());
+        let snap = |v: f64| {
+            let g = (v / minor).round() * minor;
+            let v = if ((v - g) * scale).abs() < 7.0 { g } else { (v / precision).round() * precision };
+            (v * 1e10).round() / 1e10
+        };
+        let (wx, wy) = (snap(wx), snap(wy));
+
+        let literal = |c: &Coord, v: f64| matches!(c, Coord::Literal).then(|| format_number(v));
+        let (nx, ny) = (literal(&spec[0], wx), literal(&spec[1], wy));
+        if nx.is_some() || ny.is_some() {
+            if let Some(t) = points::rewrite_point_text(&self.items[idx].text, nx, ny) {
+                self.items[idx].text = t;
+            }
+        }
+        for (c, v) in spec.iter().zip([wx, wy]) {
+            if let Coord::Slider(name) = c {
+                self.set_slider(name, v);
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// Pone el deslizador `name` en `v` (ajustado a su paso; amplía el rango si hace falta).
+    fn set_slider(&mut self, name: &str, v: f64) {
+        let Some(it) = self.items.iter_mut().find(|it| math::scan_definition(&it.text).is_some_and(|(n, f)| !f && n == name)) else {
+            return;
+        };
+        let cfg = &mut it.slider;
+        cfg.min = cfg.min.min(v);
+        cfg.max = cfg.max.max(v);
+        let v = if cfg.step > 0.0 { cfg.snap(v) } else { v };
+        it.text = format!("{name} = {}", cfg.format(v));
+        it.anim.pos = None;
     }
 
     fn poi_under(&self, rect: Rect, mouse: Pos2) -> Option<Poi> {
@@ -902,7 +1200,15 @@ impl GraphApp {
                     .and_then(|g| g.get(idx))
                     .and_then(|g| g.lines.iter().flatten().min_by(|a, b| a.distance(mouse).total_cmp(&b.distance(mouse))))
                     .map(|p| self.view.to_world(rect, *p)),
-                (Kind::Point(x, y), _) => Some((*x, *y)),
+                (Kind::Points { pts, .. }, _) => pts
+                    .iter()
+                    .copied()
+                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    .min_by(|a, b| {
+                        let da = self.view.to_screen(rect, a.0, a.1).distance(mouse);
+                        let db = self.view.to_screen(rect, b.0, b.1).distance(mouse);
+                        da.total_cmp(&db)
+                    }),
                 _ => None,
             };
             let Some((x, y)) = candidate else { continue };
@@ -955,7 +1261,7 @@ fn slider_ui(ui: &mut egui::Ui, item: &mut Item, name: &str, value: f64) -> bool
         }
 
         let mut v = value;
-        ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(60.0);
+        ui.spacing_mut().slider_width = (ui.available_width() - 100.0).max(60.0);
         let mut slider = egui::Slider::new(&mut v, cfg.min..=cfg.max).custom_formatter(|v, _| cfg.format(v));
         slider = if cfg.step > 0.0 { slider.step_by(cfg.step) } else { slider.smart_aim(true) };
         if ui.add(slider).changed() {
@@ -1024,8 +1330,9 @@ fn slider_ui(ui: &mut egui::Ui, item: &mut Item, name: &str, value: f64) -> bool
     changed
 }
 
-/// Rango del parámetro de una curva paramétrica o polar. Devuelve si cambió.
-fn domain_ui(ui: &mut egui::Ui, item: &mut Item, var: &str) -> bool {
+/// Rango del parámetro de una curva paramétrica o polar y, si `can_draw`, los controles
+/// para animar su dibujo. Devuelve si cambió algo que obliga a recalcular la curva.
+fn domain_ui(ui: &mut egui::Ui, item: &mut Item, var: &str, can_draw: bool) -> bool {
     let (mut t0, mut t1) = item.domain.unwrap_or(DEFAULT_DOMAIN);
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -1046,6 +1353,78 @@ fn domain_ui(ui: &mut egui::Ui, item: &mut Item, var: &str) -> bool {
             t1 = t0 + 1.0;
         }
         item.domain = Some((t0, t1));
+    }
+
+    if can_draw {
+        let d = &mut item.draw;
+        ui.horizontal(|ui| {
+            let (icon, tip) = if d.playing { ("⏸", "Pausar") } else { ("▶", "Dibujar la curva paso a paso") };
+            let label = if d.active { icon.to_string() } else { format!("{icon} Dibujar") };
+            if ui.button(label).on_hover_text(tip).clicked() {
+                if !d.active || d.progress >= 1.0 {
+                    d.progress = 0.0;
+                }
+                d.active = true;
+                d.playing = !d.playing;
+                changed = true;
+            }
+            if d.active {
+                if ui.button("■").on_hover_text("Terminar: mostrar la curva completa").clicked() {
+                    *d = DrawAnim { speed: d.speed, looping: d.looping, ..DrawAnim::default() };
+                    changed = true;
+                    return;
+                }
+                // Ancho fijo con margen para el texto: si el contenido excede el panel, el
+                // panel se ensancha y el deslizador con él, en bucle.
+                ui.spacing_mut().slider_width = (ui.available_width() - 110.0).max(60.0);
+                let shown = t0 + (t1 - t0) * d.progress;
+                let slider = egui::Slider::new(&mut d.progress, 0.0..=1.0)
+                    .custom_formatter(|_, _| format!("{var}={}", format_number((shown * 100.0).round() / 100.0)));
+                if ui.add(slider).changed() {
+                    d.playing = false;
+                    changed = true;
+                }
+            }
+        });
+        if d.active {
+            ui.horizontal(|ui| {
+                ui.label("Velocidad");
+                for sp in SPEEDS {
+                    ui.selectable_value(&mut d.speed, sp, format!("{}×", format_number(sp)));
+                }
+                ui.toggle_value(&mut d.looping, "↻").on_hover_text("Repetir");
+            });
+        }
+    }
+    changed
+}
+
+/// Opciones extra del editor de estilo de un punto: etiqueta y rastro.
+/// Devuelve si cambió algo que obliga a reanalizar.
+fn point_extras_ui(ui: &mut egui::Ui, item: &mut Item, name: Option<&str>, single: bool) -> bool {
+    let mut changed = false;
+    ui.separator();
+    ui.label("Etiqueta");
+    let mut show = item.label.show.unwrap_or(name.is_some() && single);
+    if ui.checkbox(&mut show, "Mostrar etiqueta").changed() {
+        item.label.show = Some(show);
+    }
+    ui.add_enabled_ui(show, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Texto:");
+            let hint = name.unwrap_or("(sin nombre)");
+            ui.add(TextEdit::singleline(&mut item.label.text).hint_text(hint).desired_width(150.0));
+        });
+        ui.checkbox(&mut item.label.coords, "Mostrar coordenadas");
+    });
+    if single {
+        ui.separator();
+        if ui.checkbox(&mut item.trace, "Dejar rastro al moverse").on_hover_text("Dibuja el camino del punto cuando cambia (p. ej. con un deslizador animado)").changed() {
+            changed = true;
+        }
+        if item.trace && ui.button("Borrar rastro").clicked() {
+            item.trail.clear();
+        }
     }
     changed
 }
@@ -1071,13 +1450,24 @@ const POLAR_ERROR: &str = "θ y r solo se usan en ecuaciones polares, p. ej. r =
 
 /// Decide qué es una sentencia ya parseada. `restrictions` son las condiciones `{…}`
 /// y `domain` el rango del parámetro si resulta ser una curva paramétrica o polar.
+/// Contexto de evaluación de una línea.
+struct Ctx<'a> {
+    env: &'a Env,
+    lists: &'a Lists,
+    /// Nombres de los deslizadores (para saber qué puntos se pueden arrastrar).
+    sliders: &'a HashSet<String>,
+    /// Rango del parámetro si la línea es una curva paramétrica o polar.
+    domain: (f64, f64),
+}
+
 fn classify(
     st: Statement,
     restrictions: &[Restriction],
-    env: &Env,
+    ctx: &Ctx,
     const_result: Option<Result<f64, MathError>>,
-    domain: (f64, f64),
+    list_result: Option<Result<ListValue, MathError>>,
 ) -> Result<Kind, MathError> {
+    let (env, domain) = (ctx.env, ctx.domain);
     let is_y = |c: &Compiled| matches!(c, Compiled::Y);
     let is_x = |c: &Compiled| matches!(c, Compiled::X);
     let raw_conds = restrictions
@@ -1138,7 +1528,55 @@ fn classify(
         }
     };
 
+    // (x(t), y(t)): curva paramétrica, si las coordenadas usan t o θ.
+    let param_curve = |items: &[Expr]| -> Option<Result<Kind, MathError>> {
+        let [ex, ey] = items else { return None };
+        let (Ok(x), Ok(y)) = (math::compile(ex, env), math::compile(ey, env)) else { return None };
+        let uses_t = x.uses_t() || y.uses_t();
+        let uses_theta = x.uses_theta() || y.uses_theta();
+        if !uses_t && !uses_theta {
+            return None;
+        }
+        Some((|| {
+            if [&x, &y].iter().any(|c| c.uses_x() || c.uses_y() || c.uses_r()) {
+                return Err(MathError("una paramétrica solo puede depender de t (o de θ)".into()));
+            }
+            if uses_t && uses_theta {
+                return Err(MathError("usa un solo parámetro: t o θ".into()));
+            }
+            let (var, name) = if uses_t { (Compiled::T, "t") } else { (Compiled::Theta, "θ") };
+            let conds = conds_param(&var)?;
+            Ok(Kind::Curve(Curve::Param {
+                x: math::restrict(param_to_x(&x, &var), conds.clone(), CondPoint::Xy),
+                y: math::restrict(param_to_x(&y, &var), conds, CondPoint::Xy),
+                t0: domain.0,
+                t1: domain.1,
+                var: name,
+            }))
+        })())
+    };
+    // Puntos ya evaluados: se filtran por las restricciones y se ve si son arrastrables.
+    let points_kind = |pts: Vec<(f64, f64)>, name: Option<String>, expr: &Expr| -> Result<Kind, MathError> {
+        let conds = conds_xy()?;
+        let pts: Vec<(f64, f64)> = pts.into_iter().filter(|&(x, y)| math::conds_hold(&conds, x, y)).collect();
+        let list = !matches!(expr, Expr::Tuple(_));
+        let drag = if list { None } else { points::drag_spec(expr, ctx.sliders) };
+        Ok(Kind::Points { pts, name, drag, list })
+    };
+
     Ok(match st {
+        Statement::Constant { name, expr } if points::is_list_syntax(&expr) => {
+            if let Expr::Tuple(items) = &expr {
+                if let Some(k) = param_curve(items) {
+                    return k;
+                }
+            }
+            match list_result.unwrap_or_else(|| Err(MathError("no se pudo evaluar".into())))? {
+                ListValue::Points(pts) => points_kind(pts, Some(name), &expr)?,
+                ListValue::Numbers(_) if restricted => return not_graph(),
+                ListValue::Numbers(v) => Kind::Numbers(v),
+            }
+        }
         Statement::Constant { name, expr } => {
             if restricted {
                 return not_graph();
@@ -1230,31 +1668,20 @@ fn classify(
             if items.len() != 2 {
                 return Err(MathError("un punto tiene 2 coordenadas".into()));
             }
-            let x = math::compile(&items[0], env)?;
-            let y = math::compile(&items[1], env)?;
-            if [&x, &y].iter().any(|c| c.uses_x() || c.uses_y() || c.uses_r()) {
-                return Err(MathError("las coordenadas no pueden depender de x, y ni r (usa t para una paramétrica)".into()));
+            if let Some(k) = param_curve(&items) {
+                return k;
             }
-            let uses_t = x.uses_t() || y.uses_t();
-            let uses_theta = x.uses_theta() || y.uses_theta();
-            if uses_t && uses_theta {
-                return Err(MathError("usa un solo parámetro: t o θ".into()));
+            let expr = Expr::Tuple(items);
+            points_kind(points::eval_points(&expr, env, ctx.lists)?, None, &expr)?
+        }
+        Statement::Bare(e) if points::is_list_syntax(&e) || points::is_number_list(&e, ctx.lists) || points::is_pointish(&e, ctx.lists) => {
+            if points::is_pointish(&e, ctx.lists) {
+                points_kind(points::eval_points(&e, env, ctx.lists)?, None, &e)?
+            } else if restricted {
+                return not_graph();
+            } else {
+                Kind::Numbers(points::eval_numbers(&e, env, ctx.lists)?)
             }
-            if uses_t || uses_theta {
-                // Curva paramétrica (x(t), y(t)).
-                let (var, name) = if uses_t { (Compiled::T, "t") } else { (Compiled::Theta, "θ") };
-                let conds = conds_param(&var)?;
-                return Ok(Kind::Curve(Curve::Param {
-                    x: math::restrict(param_to_x(&x, &var), conds.clone(), CondPoint::Xy),
-                    y: math::restrict(param_to_x(&y, &var), conds, CondPoint::Xy),
-                    t0: domain.0,
-                    t1: domain.1,
-                    var: name,
-                }));
-            }
-            let (px, py) = (x.eval(0.0, 0.0), y.eval(0.0, 0.0));
-            // Con restricciones, el punto solo se muestra si las cumple.
-            if math::conds_hold(&conds_xy()?, px, py) { Kind::Point(px, py) } else { Kind::Point(f64::NAN, f64::NAN) }
         }
         Statement::Bare(e) => {
             let c = math::compile(&e, env)?;
@@ -1327,49 +1754,6 @@ pub fn format_number(v: f64) -> String {
     if s == "-0" { "0".into() } else { s.into() }
 }
 
-fn help_ui(ui: &mut egui::Ui) {
-    let rows = [
-        ("y = x^2 + 1", "función de x"),
-        ("x = sin(y)", "función de y"),
-        ("x^2 + y^2 = 4", "curva implícita"),
-        ("y < 2x + 1", "desigualdad (región)"),
-        ("x^2 + y^2 ≤ 9", "región implícita"),
-        ("y = x^2 {x > 2; y < 12}", "restringir la gráfica"),
-        ("y = x {-1 < x < 3}", "restricción doble"),
-        ("(cos(t), sin(2t))", "curva paramétrica"),
-        ("r = 1 + cos(θ)", "curva polar (θ o theta)"),
-        ("r < 2 + sin(3θ)", "región polar"),
-        ("a = 2", "deslizador"),
-        ("f(x) = a x^3", "función con nombre"),
-        ("f(x - 1)", "usar una función"),
-        ("(1, f(1))", "punto"),
-        ("2 pi", "calcular un valor"),
-    ];
-    egui::Grid::new("help").striped(true).show(ui, |ui| {
-        for (code, desc) in rows {
-            ui.monospace(code);
-            ui.label(desc);
-            ui.end_row();
-        }
-    });
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(
-            "Funciones: sin cos tan sec csc cot asin acos atan sinh cosh tanh sqrt cbrt abs ln log exp floor ceil round sign min max mod root. \
-             Constantes: pi, e, tau. También |x| y n!.",
-        )
-        .small(),
-    );
-    ui.label(
-        RichText::new(
-            "Arrastra para mover, rueda para hacer zoom. Haz clic en una curva para ver sus cortes, máximos, mínimos e \
-             intersecciones. Clic en el círculo de color: estilo y visibilidad. Los deslizadores tienen \
-             ▶ para animarlos y ⚙ para cambiar rango, paso, velocidad y modo.",
-        )
-        .small(),
-    );
-}
-
 impl eframe::App for GraphApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(&ui.ctx().clone());
@@ -1380,7 +1764,7 @@ impl eframe::App for GraphApp {
         egui::Panel::left("expresiones")
             .resizable(true)
             .default_size(380.0)
-            .min_size(260.0)
+            .size_range(260.0..=(ui.available_width() * 0.6).max(260.0))
             .show(ui, |ui| self.expressions_panel(ui));
 
         // El panel puede haber cambiado textos: reanalizar antes de dibujar.
@@ -1388,6 +1772,17 @@ impl eframe::App for GraphApp {
         self.apply_theme(&ui.ctx().clone());
 
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
+
+        // Guía de uso (ventana aparte). "Probar" añade el ejemplo a la lista.
+        for example in help::help_window(&ui.ctx().clone(), &mut self.help_open, &mut self.help_section) {
+            match self.items.last_mut() {
+                Some(last) if last.text.trim().is_empty() => last.text = example,
+                _ => {
+                    self.push_item(&example);
+                }
+            }
+            self.revision += 1;
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
