@@ -1,0 +1,52 @@
+# Compila AppGrafica para Windows en cada push y deja el .exe listo para descargar.
+# Al subir una etiqueta v* (p. ej. v0.1.0) además publica una versión en "Releases".
+name: Windows
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Compilar
+        run: cargo build --release
+
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/app_grafica.exe dist/AppGrafica.exe
+          Copy-Item windows/LEEME.txt dist/LEEME.txt
+          Compress-Archive -Path dist/* -DestinationPath AppGrafica-Windows.zip -Force
+
+      - name: Subir el .exe (pestaña Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppGrafica-Windows
+          path: dist/
+
+      - name: Publicar versión (solo con etiquetas v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AppGrafica ${{ github.ref_name }}
+          files: AppGrafica-Windows.zip
+          body: |
+            Descarga **AppGrafica-Windows.zip**, descomprímelo y abre `AppGrafica.exe`. No hace falta instalar nada.
+            Si Windows muestra "Windows protegió su PC", pulsa "Más información" → "Ejecutar de todas formas".

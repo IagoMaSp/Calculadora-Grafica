@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.37.0", features = ["persistence"] }
+eframe = { version = "0.37.0", features = ["persistence", "glow"] }
 num-complex = "0.4.6"
 serde = { version = "1.0.229", features = ["derive"] }
 
@@ -17,3 +17,10 @@ strip = true
 # Compilar dependencias optimizadas también en debug: la app se nota fluida al desarrollar.
 [profile.dev.package."*"]
 opt-level = 2
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
+# Icono y datos del .exe (solo se usa al compilar para Windows).
+[build-dependencies]
+winresource = "0.1"
