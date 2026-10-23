@@ -510,6 +510,12 @@ fn nice_step(raw: f64) -> (f64, u32) {
     }
 }
 
+/// Paso de las líneas menores de la cuadrícula (para ajustar puntos arrastrados).
+pub fn minor_step(view: &View, label_size: f32) -> f64 {
+    let (step, subdiv) = nice_step((60.0 + 2.5 * label_size as f64) / view.scale);
+    step / subdiv as f64
+}
+
 pub fn format_tick(v: f64, step: f64) -> String {
     if v.abs() < step * 1e-6 {
         return "0".into();
@@ -569,8 +575,11 @@ pub fn draw_grid(painter: &Painter, view: &View, rect: Rect, colors: &GridColors
 
     // Etiquetas: pegadas al eje, o al borde si el eje no se ve.
     let font = FontId::proportional(colors.label_size);
-    let label_y = origin.y.clamp(rect.top() + 2.0, rect.bottom() - colors.label_size - 8.0);
-    let label_x = origin.x.clamp(rect.left() + colors.label_size * 2.8, rect.right() - 4.0);
+    // `max` evita un rango invertido (y un pánico de clamp) si el lienzo es muy pequeño.
+    let top = rect.top() + 2.0;
+    let label_y = origin.y.clamp(top, (rect.bottom() - colors.label_size - 8.0).max(top));
+    let left = rect.left() + colors.label_size * 2.8;
+    let label_x = origin.x.clamp(left, (rect.right() - 4.0).max(left));
     let draw_label = |pos: Pos2, align: Align2, text: String| {
         let galley = painter.layout_no_wrap(text, font.clone(), colors.label);
         let r = align.anchor_size(pos, galley.size()).expand(1.5);

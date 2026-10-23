@@ -42,8 +42,15 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, MathError> {
             i += 1;
         } else if c.is_ascii_digit() || (c == '.' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
             let start = i;
-            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
+            }
+            // Un único punto decimal, y solo si le sigue un dígito: así "1...5" es 1 … 5.
+            if chars.get(i) == Some(&'.') && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()) {
+                i += 1;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
             }
             let s: String = chars[start..i].iter().collect();
             let v = s.parse::<f64>().map_err(|_| MathError(format!("número inválido: {s}")))?;
@@ -68,7 +75,14 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, MathError> {
                     i += 1;
                     continue;
                 }
-                '+' | '-' | '*' | '/' | '^' | '(' | ')' | ',' | '|' | '=' | '!' => c,
+                '.' if chars[i..].starts_with(&['.', '.', '.']) => {
+                    out.push(Tok::Op('…'));
+                    i += 3;
+                    continue;
+                }
+                // Campo de un punto con nombre: A.x, A.y
+                '.' if chars.get(i + 1).is_some_and(|d| d.is_alphabetic()) => '.',
+                '+' | '-' | '*' | '/' | '^' | '(' | ')' | ',' | '|' | '=' | '!' | '[' | ']' | '…' => c,
                 _ => return err(format!("carácter inesperado '{c}'")),
             };
             out.push(Tok::Op(op));
@@ -132,6 +146,12 @@ pub enum Expr {
     Tuple(Vec<Expr>),
     /// Expresión con dominio restringido: `x^2 {x > 0}` (en definiciones de funciones).
     Restrict(Box<Expr>, Vec<Restriction>),
+    /// Lista `[a, b, c]`.
+    List(Vec<Expr>),
+    /// Rango `[inicio ... fin]` o `[inicio, segundo ... fin]` (el paso es segundo − inicio).
+    Range(Box<Expr>, Option<Box<Expr>>, Box<Expr>),
+    /// `cuerpo for var = lista`: el cuerpo evaluado para cada valor de la lista.
+    For { body: Box<Expr>, var: String, list: Box<Expr> },
 }
 
 /// Condición `lhs <op> rhs` de una restricción `{…}`.
@@ -275,10 +295,22 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Result<Expr, MathError> {
         let mut e = self.parse_primary()?;
-        while self.eat('!') {
-            e = Expr::F1(Func1::Fact, Box::new(e));
+        loop {
+            if self.eat('!') {
+                e = Expr::F1(Func1::Fact, Box::new(e));
+            } else if self.eat('.') {
+                // A.x / A.y: coordenada de un punto con nombre.
+                let (Expr::Var(name), Some(Tok::Ident(field))) = (&e, self.next()) else {
+                    return err("usa .x o .y después del nombre de un punto");
+                };
+                if field != "x" && field != "y" {
+                    return err(format!("'.{field}' no existe: usa .x o .y"));
+                }
+                e = Expr::Var(format!("{name}.{field}"));
+            } else {
+                return Ok(e);
+            }
         }
-        Ok(e)
     }
 
     /// Argumento de una función escrita sin paréntesis: "sin 2x" = sin(2x).
@@ -320,6 +352,24 @@ impl<'a> Parser<'a> {
                 let inner = self.parse_expr()?;
                 self.expect('|')?;
                 Ok(Expr::F1(Func1::Abs, Box::new(inner)))
+            }
+            Some(Tok::Op('[')) => {
+                let mut items = vec![self.parse_expr()?];
+                while self.eat(',') {
+                    items.push(self.parse_expr()?);
+                }
+                if self.eat('…') {
+                    let end = Box::new(self.parse_expr()?);
+                    self.expect(']')?;
+                    let mut it = items.into_iter();
+                    return match (it.next(), it.next(), it.next()) {
+                        (Some(a), None, _) => Ok(Expr::Range(Box::new(a), None, end)),
+                        (Some(a), Some(b), None) => Ok(Expr::Range(Box::new(a), Some(Box::new(b)), end)),
+                        _ => err("un rango es [inicio ... fin] o [inicio, segundo ... fin]"),
+                    };
+                }
+                self.expect(']')?;
+                Ok(Expr::List(items))
             }
             Some(Tok::Ident(name)) => self.parse_ident(name),
             Some(Tok::Op(c)) => err(format!("'{c}' inesperado")),
@@ -471,6 +521,15 @@ fn split_comparisons(src: &str) -> (Vec<&str>, Vec<Comparison>) {
     (parts, cmps)
 }
 
+/// Separa `cuerpo for var = lista` en (cuerpo, var, lista).
+fn split_for(src: &str) -> Option<(&str, &str, &str)> {
+    let pos = src.find(" for ")?;
+    let (body, rest) = (&src[..pos], &src[pos + 5..]);
+    let (var, list) = rest.split_once('=')?;
+    let var = var.trim();
+    (var.chars().all(|c| c.is_alphanumeric() || c == '_') && !var.is_empty()).then_some((body, var, list))
+}
+
 /// Separa `expr {cond; cond} {cond}` en la expresión y las condiciones (como texto).
 fn split_restrictions(src: &str) -> Result<(&str, Vec<&str>), MathError> {
     let Some(open) = src.find('{') else {
@@ -546,7 +605,22 @@ pub fn parse_statement(
 ) -> Result<(Statement, Vec<Restriction>), MathError> {
     let (main, conds) = split_restrictions(src)?;
     let restrictions = parse_restrictions(&conds, user_funcs, user_names)?;
-    let st = parse_main(main, user_funcs, user_names)?;
+    let st = match split_for(main) {
+        // cuerpo for n = lista
+        Some((body_src, var, list_src)) => {
+            let list = Box::new(parse_expr(list_src, user_funcs, user_names)?);
+            // El nombre de la variable debe reconocerse entero (p. ej. "k" en "2k").
+            let mut names = user_names.clone();
+            names.insert(var.to_string());
+            let wrap = |body: Expr| Expr::For { body: Box::new(body), var: var.to_string(), list: list.clone() };
+            match parse_main(body_src, user_funcs, &names)? {
+                Statement::Constant { name, expr } => Statement::Constant { name, expr: wrap(expr) },
+                Statement::Bare(e) => Statement::Bare(wrap(e)),
+                _ => return err("'for' solo sirve para crear listas: (n, n^2) for n = [1...5]"),
+            }
+        }
+        None => parse_main(main, user_funcs, user_names)?,
+    };
     Ok(match st {
         Statement::FuncDef { name, params, body } if !restrictions.is_empty() => {
             (Statement::FuncDef { name, params, body: Expr::Restrict(Box::new(body), restrictions) }, Vec::new())
@@ -792,10 +866,12 @@ fn gamma(x: f64) -> f64 {
 }
 
 /// Entorno de definiciones globales usado al compilar.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Env {
     pub constants: HashMap<String, f64>,
     pub funcs: HashMap<String, (Vec<String>, Expr)>,
+    /// Nombres de puntos y listas definidos (`A = (1, 2)`), para dar mejores errores.
+    pub points: HashSet<String>,
 }
 
 pub fn compile(e: &Expr, env: &Env) -> Result<Compiled, MathError> {
@@ -825,6 +901,8 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
                 Compiled::Num(*v)
             } else if env.funcs.contains_key(name) {
                 return err(format!("'{name}' es una función: usa {name}(…)"));
+            } else if env.points.contains(name) {
+                return err(format!("'{name}' es un punto o una lista: usa {name}.x o {name}.y"));
             } else {
                 return err(format!("'{name}' no está definido"));
             }
@@ -850,6 +928,7 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
             compile_scoped(body, env, &inner, depth + 1)?
         }
         Expr::Tuple(_) => return err("los puntos (a, b) solo pueden ir solos en una línea"),
+        Expr::List(_) | Expr::Range(..) | Expr::For { .. } => return err("las listas solo pueden ir solas en una línea"),
         Expr::Restrict(body, rs) => {
             let value = compile_scoped(body, env, locals, depth)?;
             let conds = rs
