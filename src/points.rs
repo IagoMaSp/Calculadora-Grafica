@@ -86,6 +86,16 @@ fn collect_vars(e: &Expr, out: &mut HashSet<String>) {
             out.extend(inner);
             collect_vars(list, out);
         }
+        Expr::Big { var, from, to, body, .. } => {
+            collect_vars(from, out);
+            collect_vars(to, out);
+            let mut inner = HashSet::new();
+            collect_vars(body, &mut inner);
+            inner.remove(var);
+            out.extend(inner);
+        }
+        Expr::Deriv { body, .. } => collect_vars(body, out),
+        Expr::Prime { arg, .. } => collect_vars(arg, out),
     }
 }
 

@@ -4,9 +4,11 @@
 mod analysis;
 mod app;
 mod help;
+mod keyboard;
 mod math;
 mod plot;
 mod points;
+mod special;
 mod style;
 
 fn main() {

@@ -9,6 +9,7 @@ use eframe::egui::{
 
 use crate::analysis::{self, Curve, Poi};
 use crate::help;
+use crate::keyboard::{self, KeyboardState};
 use crate::math::{self, C64, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::points::{self, Coord, ListValue, Lists};
@@ -253,6 +254,12 @@ pub struct GraphApp {
     /// Punto que se está arrastrando.
     #[serde(skip)]
     dragging: Option<u64>,
+    /// Teclado en pantalla.
+    keyboard_open: bool,
+    keyboard: KeyboardState,
+    /// Última expresión que tuvo el cursor: ahí escribe el teclado.
+    #[serde(skip)]
+    last_edit: Option<u64>,
     #[serde(skip)]
     help_open: bool,
     #[serde(skip)]
@@ -275,6 +282,9 @@ impl Default for GraphApp {
             focus_next: None,
             theme_applied: None,
             dragging: None,
+            keyboard_open: false,
+            keyboard: KeyboardState::default(),
+            last_edit: None,
             help_open: false,
             help_section: 0,
         };
@@ -598,6 +608,77 @@ impl GraphApp {
         }
     }
 
+    /// Aplica una tecla del teclado en pantalla a la expresión que tenía el cursor
+    /// (o a una nueva, si no había ninguna).
+    fn apply_key(&mut self, ctx: &egui::Context, action: keyboard::Action) {
+        let idx = match self.last_edit.and_then(|id| self.items.iter().position(|it| it.id == id)) {
+            Some(i) => i,
+            None => {
+                if !self.items.last().is_some_and(|it| it.text.trim().is_empty()) {
+                    self.push_item("");
+                }
+                self.items.len() - 1
+            }
+        };
+        let id = self.items[idx].id;
+        let edit_id = expr_edit_id(id);
+        let mut chars: Vec<char> = self.items[idx].text.chars().collect();
+        let mut state = egui::text_edit::TextEditState::load(ctx, edit_id).unwrap_or_default();
+        // Cursor y selección actuales (por defecto, al final del texto).
+        let (mut lo, mut hi) = state
+            .cursor
+            .char_range()
+            .map(|r| {
+                let (a, b) = (r.primary.index.0, r.secondary.index.0);
+                (a.min(b), a.max(b))
+            })
+            .unwrap_or((chars.len(), chars.len()));
+        lo = lo.min(chars.len());
+        hi = hi.min(chars.len());
+
+        let cursor = match action {
+            keyboard::Action::Insert { text, back } => {
+                let ins: Vec<char> = text.chars().collect();
+                chars.splice(lo..hi, ins.iter().copied());
+                lo + ins.len() - back.min(ins.len())
+            }
+            keyboard::Action::Backspace => {
+                if hi > lo {
+                    chars.drain(lo..hi);
+                    lo
+                } else if lo > 0 {
+                    chars.remove(lo - 1);
+                    lo - 1
+                } else {
+                    0
+                }
+            }
+            keyboard::Action::Left => lo.saturating_sub(if hi > lo { 0 } else { 1 }),
+            keyboard::Action::Right => (hi + if hi > lo { 0 } else { 1 }).min(chars.len()),
+            keyboard::Action::Enter => {
+                let item = self.new_item("");
+                let new_id = item.id;
+                self.items.insert(idx + 1, item);
+                self.focus_next = Some(new_id);
+                self.last_edit = Some(new_id);
+                self.revision += 1;
+                return;
+            }
+        };
+        let text: String = chars.into_iter().collect();
+        if text != self.items[idx].text {
+            self.items[idx].text = text;
+            self.revision += 1;
+        }
+        let c = egui::text::CCursor::new(cursor);
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
+        state.store(ctx, edit_id);
+        // Devolver el foco al campo para seguir escribiendo.
+        ctx.memory_mut(|m| m.request_focus(edit_id));
+        self.last_edit = Some(id);
+        self.selected = Some(id);
+    }
+
     // ───────────────────────── Panel de expresiones ─────────────────────────
 
     fn expressions_panel(&mut self, ui: &mut egui::Ui) {
@@ -607,6 +688,9 @@ impl GraphApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(RichText::new("❓").size(16.0)).on_hover_text("Guía de uso").clicked() {
                     self.help_open = true;
+                }
+                if ui.add(egui::Button::new(RichText::new("⌨").size(16.0)).selected(self.keyboard_open)).on_hover_text("Teclado").clicked() {
+                    self.keyboard_open = !self.keyboard_open;
                 }
                 let resp = ui.button(RichText::new("⚙").size(16.0)).on_hover_text("Ajustes");
                 egui::Popup::menu(&resp)
@@ -686,6 +770,7 @@ impl GraphApp {
                         }
                         let resp = ui.add(
                             TextEdit::singleline(&mut item.text)
+                                .id(expr_edit_id(item.id))
                                 .desired_width(ui.available_width())
                                 .font(font.clone())
                                 .margin(vec2(6.0, 4.0))
@@ -697,6 +782,9 @@ impl GraphApp {
                         }
                         if resp.gained_focus() {
                             self.selected = Some(item.id);
+                        }
+                        if resp.has_focus() {
+                            self.last_edit = Some(item.id);
                         }
                         if resp.changed() {
                             changed = true;
@@ -1453,6 +1541,11 @@ fn point_extras_ui(ui: &mut egui::Ui, item: &mut Item, name: Option<&str>, singl
     changed
 }
 
+/// Id del campo de texto de una expresión (para que el teclado sepa dónde escribir).
+fn expr_edit_id(item_id: u64) -> egui::Id {
+    egui::Id::unique(("expresion", item_id))
+}
+
 fn draw_tooltip(painter: &egui::Painter, rect: Rect, p: Pos2, text: String, accent: Color32, dark: bool) {
     let text_color = if dark { Color32::from_gray(230) } else { Color32::from_gray(20) };
     let galley = painter.layout_no_wrap(text, FontId::proportional(14.0), text_color);
@@ -1869,6 +1962,17 @@ impl eframe::App for GraphApp {
         self.animate(&ui.ctx().clone());
         self.analyze();
 
+        // Teclado abajo, a todo el ancho.
+        if self.keyboard_open {
+            let mut action = None;
+            egui::Panel::bottom("teclado").resizable(false).exact_size(300.0).show(ui, |ui| {
+                action = keyboard::keyboard_ui(ui, &mut self.keyboard, &mut self.keyboard_open);
+            });
+            if let Some(a) = action {
+                self.apply_key(ui.ctx(), a);
+            }
+        }
+
         egui::Panel::left("expresiones")
             .resizable(true)
             .default_size(380.0)
@@ -1895,5 +1999,42 @@ impl eframe::App for GraphApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_inserts_at_cursor() {
+        let ctx = egui::Context::default();
+        let mut app = GraphApp::default();
+        app.items.clear();
+        let id = app.push_item("y = 2");
+        app.last_edit = Some(id);
+        let ins = |text: &str, back: usize| keyboard::Action::Insert { text: text.into(), back };
+
+        // Sin cursor guardado se escribe al final; la función deja el cursor dentro.
+        app.apply_key(&ctx, ins("sin()", 1));
+        assert_eq!(app.items[0].text, "y = 2sin()");
+        app.apply_key(&ctx, ins("x", 0));
+        assert_eq!(app.items[0].text, "y = 2sin(x)");
+        // Plantillas con varios huecos: el cursor queda en el primero.
+        app.apply_key(&ctx, keyboard::Action::Right);
+        app.apply_key(&ctx, ins(" + ", 0));
+        app.apply_key(&ctx, ins("nCr(, )", 3));
+        app.apply_key(&ctx, ins("5", 0));
+        assert_eq!(app.items[0].text, "y = 2sin(x) + nCr(5, )");
+        app.apply_key(&ctx, keyboard::Action::Backspace);
+        assert_eq!(app.items[0].text, "y = 2sin(x) + nCr(, )");
+        app.apply_key(&ctx, keyboard::Action::Left);
+        app.apply_key(&ctx, keyboard::Action::Backspace);
+        assert_eq!(app.items[0].text, "y = 2sin(x) + nC(, )");
+        // ↵ crea una línea nueva y pasa a escribir en ella.
+        app.apply_key(&ctx, keyboard::Action::Enter);
+        app.apply_key(&ctx, ins("α", 0));
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(app.items[1].text, "α");
     }
 }
