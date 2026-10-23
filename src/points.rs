@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::math::{self, Env, Expr, MathError};
+use crate::math::{self, C64, Env, Expr, MathError};
 
 /// Máximo de elementos de una lista (evita bloquear la app con [1...1e9]).
 const MAX_LEN: usize = 10_000;
@@ -89,7 +89,8 @@ fn collect_vars(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
-fn scalar(e: &Expr, env: &Env) -> Result<f64, MathError> {
+/// Valor (posiblemente complejo) de una expresión constante.
+fn scalar_c(e: &Expr, env: &Env) -> Result<C64, MathError> {
     let c = math::compile(e, env)?;
     if c.uses_x() || c.uses_y() {
         return err("los elementos de una lista no pueden depender de x ni y");
@@ -97,17 +98,45 @@ fn scalar(e: &Expr, env: &Env) -> Result<f64, MathError> {
     if c.uses_t() || c.uses_theta() || c.uses_r() {
         return err("los elementos de una lista no pueden usar t, θ ni r");
     }
-    Ok(c.eval(0.0, 0.0))
+    Ok(math::value_of(&c))
 }
 
-/// Evalúa una expresión como lista de números (un escalar da una lista de 1 elemento).
-/// Si usa listas con nombre, se evalúa elemento a elemento: (L, L^2) con L = [1, 2, 3].
+fn scalar(e: &Expr, env: &Env) -> Result<f64, MathError> {
+    let z = scalar_c(e, env)?;
+    if z.im != 0.0 {
+        return err("aquí se necesita un número real, no un complejo");
+    }
+    Ok(z.re)
+}
+
+/// Lista de números reales, o de puntos del plano complejo si algún elemento es complejo.
+pub fn eval_number_list(e: &Expr, env: &Env, lists: &Lists) -> Result<ListValue, MathError> {
+    let values = eval_values(e, env, lists)?;
+    Ok(if values.iter().all(|z| z.im == 0.0) {
+        ListValue::Numbers(values.into_iter().map(|z| z.re).collect())
+    } else {
+        ListValue::Points(values.into_iter().map(|z| (z.re, z.im)).collect())
+    })
+}
+
+/// Evalúa una lista de números reales; si algún elemento es complejo, error.
 pub fn eval_numbers(e: &Expr, env: &Env, lists: &Lists) -> Result<Vec<f64>, MathError> {
-    let out = match e {
+    let values = eval_values(e, env, lists)?;
+    if values.iter().any(|z| z.im != 0.0) {
+        return err("la lista tiene números complejos");
+    }
+    Ok(values.into_iter().map(|z| z.re).collect())
+}
+
+/// Evalúa una expresión como lista de números, reales o complejos (un escalar da una
+/// lista de 1 elemento). Si usa listas con nombre, se evalúa elemento a elemento:
+/// (L, L^2) con L = [1, 2, 3].
+pub fn eval_values(e: &Expr, env: &Env, lists: &Lists) -> Result<Vec<C64>, MathError> {
+    let out: Vec<C64> = match e {
         Expr::List(items) => {
             let mut out = Vec::new();
             for it in items {
-                out.extend(eval_numbers(it, env, lists)?);
+                out.extend(eval_values(it, env, lists)?);
             }
             out
         }
@@ -125,7 +154,7 @@ pub fn eval_numbers(e: &Expr, env: &Env, lists: &Lists) -> Result<Vec<f64>, Math
             if n > MAX_LEN {
                 return err(format!("la lista tiene más de {MAX_LEN} elementos"));
             }
-            (0..n).map(|k| start + step * k as f64).collect()
+            (0..n).map(|k| C64::new(start + step * k as f64, 0.0)).collect()
         }
         Expr::For { body, var, list } => {
             let values = eval_numbers(list, env, lists)?;
@@ -133,7 +162,7 @@ pub fn eval_numbers(e: &Expr, env: &Env, lists: &Lists) -> Result<Vec<f64>, Math
             let mut out = Vec::new();
             for v in values {
                 env2.constants.insert(var.clone(), v);
-                out.extend(eval_numbers(body, &env2, lists)?);
+                out.extend(eval_values(body, &env2, lists)?);
             }
             out
         }
@@ -144,7 +173,7 @@ pub fn eval_numbers(e: &Expr, env: &Env, lists: &Lists) -> Result<Vec<f64>, Math
             collect_vars(e, &mut vars);
             let used: Vec<&String> = vars.iter().filter(|v| lists.numbers.contains_key(*v)).collect();
             if used.is_empty() {
-                vec![scalar(e, env)?]
+                vec![scalar_c(e, env)?]
             } else {
                 let n = used.iter().map(|v| lists.numbers[*v].len()).min().unwrap_or(0);
                 let mut env2 = env.clone();
@@ -153,7 +182,7 @@ pub fn eval_numbers(e: &Expr, env: &Env, lists: &Lists) -> Result<Vec<f64>, Math
                     for v in &used {
                         env2.constants.insert((*v).clone(), lists.numbers[*v][i]);
                     }
-                    out.push(scalar(e, &env2)?);
+                    out.push(scalar_c(e, &env2)?);
                 }
                 out
             }
@@ -312,6 +341,9 @@ mod tests {
         let pts = eval_points(&parse("([1, 2], 0)"), &env, &lists).unwrap();
         assert_eq!(pts, vec![(1.0, 0.0), (2.0, 0.0)]);
         assert!(eval_numbers(&parse("[1...1000000]"), &env, &lists).is_err());
+        let z = eval_values(&parse("[1 + i, 2i]"), &env, &lists).unwrap();
+        assert_eq!(z, vec![C64::new(1.0, 1.0), C64::new(0.0, 2.0)]);
+        assert!(eval_numbers(&parse("[1 + i, 2i]"), &env, &lists).is_err());
     }
 
     #[test]

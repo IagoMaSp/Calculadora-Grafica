@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+pub use num_complex::Complex64 as C64;
+
 // ───────────────────────────── Errores ─────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +103,10 @@ pub enum Func1 {
     Sinh, Cosh, Tanh,
     Sqrt, Cbrt, Abs, Ln, Log, Exp,
     Floor, Ceil, Round, Sign, Fact,
+    /// Parte real, parte imaginaria, argumento y conjugado de un complejo.
+    Re, Im, Arg, Conj,
+    /// Módulo de un complejo (|z|); el compilador lo usa en vez de Abs si hace falta.
+    CAbs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,6 +124,8 @@ const FUNC1_NAMES: &[(&str, Func1)] = &[
     ("sqrt", Func1::Sqrt), ("cbrt", Func1::Cbrt), ("abs", Func1::Abs),
     ("ln", Func1::Ln), ("log", Func1::Log), ("exp", Func1::Exp),
     ("floor", Func1::Floor), ("ceil", Func1::Ceil), ("round", Func1::Round), ("sign", Func1::Sign),
+    ("re", Func1::Re), ("real", Func1::Re), ("im", Func1::Im), ("imag", Func1::Im),
+    ("arg", Func1::Arg), ("conj", Func1::Conj),
 ];
 
 const FUNC2_NAMES: &[(&str, Func2)] = &[
@@ -674,6 +682,8 @@ fn parse_main(src: &str, user_funcs: &HashSet<String>, user_names: &HashSet<Stri
 #[derive(Debug, Clone, PartialEq)]
 pub enum Compiled {
     Num(f64),
+    /// Constante compleja (parte real, parte imaginaria), con parte imaginaria ≠ 0.
+    CNum(f64, f64),
     X,
     Y,
     /// Parámetro `t` de una curva paramétrica (se sustituye antes de evaluar).
@@ -715,10 +725,16 @@ impl Compiled {
     pub fn eval(&self, x: f64, y: f64) -> f64 {
         match self {
             Compiled::Num(v) => *v,
+            Compiled::CNum(re, im) => if *im == 0.0 { *re } else { f64::NAN },
             Compiled::X => x,
             Compiled::Y => y,
             Compiled::T | Compiled::Theta | Compiled::R => f64::NAN,
             Compiled::Neg(a) => -a.eval(x, y),
+            // Funciones que extraen un real de un complejo: el argumento se evalúa en complejo.
+            Compiled::F1(f @ (Func1::Re | Func1::Im | Func1::Arg | Func1::Conj | Func1::CAbs), a) => {
+                let z = apply1_c(*f, a.eval_c(x, y));
+                if z.im == 0.0 { z.re } else { f64::NAN }
+            }
             Compiled::F1(f, a) => apply1(*f, a.eval(x, y)),
             Compiled::F2(f, a, b) => apply2(*f, a.eval(x, y), b.eval(x, y)),
             Compiled::Cond { value, conds, sub } => {
@@ -730,6 +746,49 @@ impl Compiled {
                 };
                 if conds_hold(conds, px, py) { v } else { f64::NAN }
             }
+        }
+    }
+
+    /// Evaluación en números complejos (las condiciones se comprueban con la parte real).
+    pub fn eval_c(&self, x: f64, y: f64) -> C64 {
+        match self {
+            Compiled::Num(v) => C64::new(*v, 0.0),
+            Compiled::CNum(re, im) => C64::new(*re, *im),
+            Compiled::X => C64::new(x, 0.0),
+            Compiled::Y => C64::new(y, 0.0),
+            Compiled::T | Compiled::Theta | Compiled::R => C64::new(f64::NAN, 0.0),
+            Compiled::Neg(a) => -a.eval_c(x, y),
+            Compiled::F1(f, a) => apply1_c(*f, a.eval_c(x, y)),
+            Compiled::F2(f, a, b) => apply2_c(*f, a.eval_c(x, y), b.eval_c(x, y)),
+            Compiled::Cond { value, conds, sub } => {
+                let v = value.eval_c(x, y);
+                let (px, py) = match sub {
+                    CondPoint::Xy => (x, y),
+                    CondPoint::ValueIsY => (x, v.re),
+                    CondPoint::ValueIsX => (v.re, y),
+                };
+                if conds_hold(conds, px, py) { v } else { C64::new(f64::NAN, 0.0) }
+            }
+        }
+    }
+
+    /// ¿Contiene complejos (constantes complejas o funciones de complejos)?
+    pub fn needs_complex(&self) -> bool {
+        self.any(&|c| {
+            matches!(c, Compiled::CNum(..) | Compiled::F1(Func1::Re | Func1::Im | Func1::Arg | Func1::Conj | Func1::CAbs, _))
+        })
+    }
+
+    /// ¿Algún valor complejo llega al resultado sin pasar por re, im, arg o |…|?
+    /// (Una gráfica real no puede dibujar algo así.)
+    pub fn leaks_complex(&self) -> bool {
+        match self {
+            Compiled::CNum(..) => true,
+            Compiled::F1(Func1::Re | Func1::Im | Func1::Arg | Func1::CAbs, _) => false,
+            Compiled::Neg(a) | Compiled::F1(_, a) => a.leaks_complex(),
+            Compiled::F2(_, a, b) => a.leaks_complex() || b.leaks_complex(),
+            Compiled::Cond { value, conds, .. } => value.leaks_complex() || conds.iter().any(|(c, _)| c.leaks_complex()),
+            _ => false,
         }
     }
 
@@ -810,7 +869,102 @@ fn apply1(f: Func1, v: f64) -> f64 {
             if v == 0.0 { 0.0 } else { v.signum() }
         }
         Func1::Fact => gamma(v + 1.0),
+        Func1::Re | Func1::Conj => v,
+        Func1::Im => if v.is_nan() { v } else { 0.0 },
+        Func1::Arg => if v < 0.0 { std::f64::consts::PI } else if v.is_nan() { v } else { 0.0 },
+        Func1::CAbs => v.abs(),
     }
+}
+
+/// Valor complejo de un resultado: si la evaluación real da un número finito y la
+/// expresión no tiene complejos, ese; si no (p. ej. sqrt(-1)), la evaluación compleja.
+/// Así (-8)^(1/3) sigue siendo -2 y sqrt(-4) es 2i.
+pub fn value_of(c: &Compiled) -> C64 {
+    let v = c.eval(0.0, 0.0);
+    if v.is_finite() && !c.needs_complex() {
+        return C64::new(v, 0.0);
+    }
+    snap(c.eval_c(0.0, 0.0))
+}
+
+/// Anula partes residuales por redondeo: e^(iπ) = -1 + 1.2e-16 i  →  -1.
+pub fn snap(z: C64) -> C64 {
+    let scale = z.re.abs().max(z.im.abs()).max(1.0);
+    let clean = |v: f64| if v.abs() <= 1e-13 * scale { 0.0 } else { v };
+    C64::new(clean(z.re), clean(z.im))
+}
+
+fn cnan() -> C64 {
+    C64::new(f64::NAN, f64::NAN)
+}
+
+/// Aplica una función real solo si el argumento es real.
+fn real_only(z: C64, f: impl Fn(f64) -> f64) -> C64 {
+    if z.im == 0.0 { C64::new(f(z.re), 0.0) } else { cnan() }
+}
+
+fn apply1_c(f: Func1, z: C64) -> C64 {
+    let one = C64::new(1.0, 0.0);
+    match f {
+        Func1::Sin => z.sin(),
+        Func1::Cos => z.cos(),
+        Func1::Tan => z.tan(),
+        Func1::Sec => one / z.cos(),
+        Func1::Csc => one / z.sin(),
+        Func1::Cot => one / z.tan(),
+        Func1::Asin => z.asin(),
+        Func1::Acos => z.acos(),
+        Func1::Atan => z.atan(),
+        Func1::Sinh => z.sinh(),
+        Func1::Cosh => z.cosh(),
+        Func1::Tanh => z.tanh(),
+        Func1::Sqrt => z.sqrt(),
+        // Raíz cúbica real para reales negativos (como en la parte real de la app).
+        Func1::Cbrt => if z.im == 0.0 { C64::new(z.re.cbrt(), 0.0) } else { z.cbrt() },
+        Func1::Abs | Func1::CAbs => C64::new(z.norm(), 0.0),
+        Func1::Ln => z.ln(),
+        Func1::Log => z.log10(),
+        Func1::Exp => z.exp(),
+        Func1::Floor => real_only(z, f64::floor),
+        Func1::Ceil => real_only(z, f64::ceil),
+        Func1::Round => real_only(z, f64::round),
+        // sign(z) = z / |z|
+        Func1::Sign => if z == C64::new(0.0, 0.0) { z } else { z / z.norm() },
+        Func1::Fact => real_only(z, |v| gamma(v + 1.0)),
+        Func1::Re => C64::new(z.re, 0.0),
+        Func1::Im => C64::new(z.im, 0.0),
+        Func1::Arg => C64::new(z.arg(), 0.0),
+        Func1::Conj => z.conj(),
+    }
+}
+
+fn apply2_c(f: Func2, a: C64, b: C64) -> C64 {
+    let real2 = |g: fn(f64, f64) -> f64| if a.im == 0.0 && b.im == 0.0 { C64::new(g(a.re, b.re), 0.0) } else { cnan() };
+    match f {
+        Func2::Add => a + b,
+        Func2::Sub => a - b,
+        Func2::Mul => a * b,
+        Func2::Div => a / b,
+        Func2::Pow => cpow(a, b),
+        Func2::Min => real2(f64::min),
+        Func2::Max => real2(f64::max),
+        Func2::Mod => real2(f64::rem_euclid),
+        Func2::Atan2 => real2(f64::atan2),
+        Func2::LogBase => b.ln() / a.ln(),
+        Func2::Root => cpow(b, C64::new(1.0, 0.0) / a),
+    }
+}
+
+/// Potencia compleja (rama principal). Exponentes enteros pequeños se calculan por
+/// multiplicación para que i^2 dé exactamente -1.
+fn cpow(a: C64, b: C64) -> C64 {
+    if b.im == 0.0 && b.re.fract() == 0.0 && b.re.abs() <= 64.0 {
+        return a.powi(b.re as i32);
+    }
+    if a == C64::new(0.0, 0.0) {
+        return if b.re > 0.0 { a } else { cnan() };
+    }
+    a.powc(b)
 }
 
 #[inline]
@@ -872,6 +1026,8 @@ pub struct Env {
     pub funcs: HashMap<String, (Vec<String>, Expr)>,
     /// Nombres de puntos y listas definidos (`A = (1, 2)`), para dar mejores errores.
     pub points: HashSet<String>,
+    /// Constantes complejas definidas (`z = 1 + 2i`).
+    pub complex: HashMap<String, C64>,
 }
 
 pub fn compile(e: &Expr, env: &Env) -> Result<Compiled, MathError> {
@@ -899,16 +1055,26 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
                 Compiled::R
             } else if let Some(v) = env.constants.get(name) {
                 Compiled::Num(*v)
+            } else if let Some(z) = env.complex.get(name) {
+                Compiled::CNum(z.re, z.im)
             } else if env.funcs.contains_key(name) {
                 return err(format!("'{name}' es una función: usa {name}(…)"));
             } else if env.points.contains(name) {
                 return err(format!("'{name}' es un punto o una lista: usa {name}.x o {name}.y"));
+            } else if name == "i" {
+                // Unidad imaginaria (si no hay nada definido con ese nombre).
+                Compiled::CNum(0.0, 1.0)
             } else {
                 return err(format!("'{name}' no está definido"));
             }
         }
         Expr::Neg(a) => Compiled::Neg(Box::new(compile_scoped(a, env, locals, depth)?)),
-        Expr::F1(f, a) => Compiled::F1(*f, Box::new(compile_scoped(a, env, locals, depth)?)),
+        Expr::F1(f, a) => {
+            let a = compile_scoped(a, env, locals, depth)?;
+            // |z| de un complejo es su módulo.
+            let f = if *f == Func1::Abs && a.needs_complex() { Func1::CAbs } else { *f };
+            Compiled::F1(f, Box::new(a))
+        }
         Expr::F2(f, a, b) => Compiled::F2(
             *f,
             Box::new(compile_scoped(a, env, locals, depth)?),
@@ -947,12 +1113,25 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
 
 /// Plegado de constantes: evalúa subárboles que no dependen de x ni y.
 fn fold(c: Compiled) -> Compiled {
+    let is_const = |c: &Compiled| matches!(c, Compiled::Num(_) | Compiled::CNum(..));
     let constant = match &c {
-        Compiled::Neg(a) | Compiled::F1(_, a) => matches!(**a, Compiled::Num(_)),
-        Compiled::F2(_, a, b) => matches!(**a, Compiled::Num(_)) && matches!(**b, Compiled::Num(_)),
+        Compiled::Neg(a) | Compiled::F1(_, a) => is_const(a),
+        Compiled::F2(_, a, b) => is_const(a) && is_const(b),
         _ => false,
     };
-    if constant { Compiled::Num(c.eval(0.0, 0.0)) } else { c }
+    if !constant {
+        return c;
+    }
+    if !c.needs_complex() {
+        let v = c.eval(0.0, 0.0);
+        if !v.is_nan() {
+            return Compiled::Num(v);
+        }
+        // sqrt(-1), ln(-1)…: sin valor real, pero sí complejo.
+    }
+    // Con complejos: si el resultado es real (p. ej. i·i o e^(iπ)), queda un número real.
+    let z = snap(c.eval_c(0.0, 0.0));
+    if z.im == 0.0 { Compiled::Num(z.re) } else { Compiled::CNum(z.re, z.im) }
 }
 
 #[cfg(test)]
@@ -1068,5 +1247,35 @@ mod tests {
         assert!((d.eval(0.0, 0.0) - 2.0).abs() < 1e-12);
         assert!(scan_definition("r = 2").is_none());
         assert!(scan_definition("t = 2").is_none());
+    }
+
+    #[test]
+    fn complex_numbers() {
+        let none = HashSet::new();
+        let val = |src: &str| value_of(&compile(&parse_expr(src, &none, &none).unwrap(), &Env::default()).unwrap());
+        let close = |z: C64, re: f64, im: f64| (z.re - re).abs() < 1e-12 && (z.im - im).abs() < 1e-12;
+        assert!(close(val("sqrt(-1)"), 0.0, 1.0));
+        assert!(close(val("i^2"), -1.0, 0.0));
+        assert!(close(val("e^(i pi)"), -1.0, 0.0));
+        assert!(close(val("(1 + 2i)(3 - i)"), 5.0, 5.0));
+        assert!(close(val("(1 + i)/(1 - i)"), 0.0, 1.0));
+        assert!(close(val("ln(-1)"), 0.0, std::f64::consts::PI));
+        assert!(close(val("|3 + 4i|"), 5.0, 0.0));
+        assert!(close(val("arg(i)"), std::f64::consts::FRAC_PI_2, 0.0));
+        assert!(close(val("conj(2 - 3i)"), 2.0, 3.0));
+        assert!(close(val("re(2 - 3i) + im(2 - 3i)"), -1.0, 0.0));
+        assert!(close(val("i^i"), (-std::f64::consts::FRAC_PI_2).exp(), 0.0));
+        // Lo real sigue siendo real.
+        assert!(close(val("(-8)^(1/3)"), -2.0, 0.0));
+        // re(√x) para x < 0 vale 0, no "indefinido".
+        let c = compile(&parse_expr("re(sqrt(x))", &none, &none).unwrap(), &Env::default()).unwrap();
+        assert_eq!(c.eval(-4.0, 0.0), 0.0);
+        assert!(!c.leaks_complex());
+        let c = compile(&parse_expr("(1 + i) x", &none, &none).unwrap(), &Env::default()).unwrap();
+        assert!(c.leaks_complex());
+        // Una variable "i" definida por el usuario tiene prioridad.
+        let mut env = Env::default();
+        env.constants.insert("i".into(), 3.0);
+        assert_eq!(value_of(&compile(&parse_expr("2i", &none, &none).unwrap(), &env).unwrap()), C64::new(6.0, 0.0));
     }
 }

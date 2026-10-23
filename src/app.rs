@@ -9,7 +9,7 @@ use eframe::egui::{
 
 use crate::analysis::{self, Curve, Poi};
 use crate::help;
-use crate::math::{self, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
+use crate::math::{self, C64, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::points::{self, Coord, ListValue, Lists};
 use crate::style::{self, EditorTarget, LineStyle, Style};
@@ -160,7 +160,8 @@ enum Kind {
     Ineq { curve: Curve, positive: bool, strict: bool, mask: Option<Compiled> },
     /// Uno o varios puntos. `name` si se definió como `A = (1, 2)`; `drag` indica qué
     /// coordenadas se pueden arrastrar con el ratón; `list` si es una lista.
-    Points { pts: Vec<(f64, f64)>, name: Option<String>, drag: Option<[Coord; 2]>, list: bool },
+    /// `value`: el número complejo que representa el punto, si viene de uno (z = 1 + 2i).
+    Points { pts: Vec<(f64, f64)>, name: Option<String>, drag: Option<[Coord; 2]>, list: bool, value: Option<C64> },
     /// Lista de números: `[1, 2, 3]`.
     Numbers(Vec<f64>),
 }
@@ -290,6 +291,8 @@ struct Hit {
     x: f64,
     y: f64,
     color: Color32,
+    /// El punto es un número complejo: se muestra como a + bi.
+    complex: bool,
 }
 
 impl GraphApp {
@@ -408,7 +411,7 @@ impl GraphApp {
         }
         let mut lists = Lists::default();
         let mut list_results: HashMap<usize, Result<ListValue, MathError>> = HashMap::new();
-        let mut const_results: HashMap<usize, Result<f64, MathError>> = HashMap::new();
+        let mut const_results: HashMap<usize, Result<C64, MathError>> = HashMap::new();
         loop {
             let mut progress = false;
             for (i, p) in parsed.iter().enumerate() {
@@ -420,7 +423,7 @@ impl GraphApp {
                     let res = if points::is_pointish(expr, &lists) {
                         points::eval_points(expr, &env, &lists).map(ListValue::Points)
                     } else {
-                        points::eval_numbers(expr, &env, &lists).map(ListValue::Numbers)
+                        points::eval_number_list(expr, &env, &lists)
                     };
                     match &res {
                         Ok(ListValue::Points(pts)) => {
@@ -443,13 +446,23 @@ impl GraphApp {
                 let res = math::compile(expr, &env).and_then(|c| {
                     if c.uses_x() || c.uses_y() {
                         Err(MathError(format!("'{name}' no puede depender de x ni y")))
+                    } else if c.uses_t() || c.uses_theta() || c.uses_r() {
+                        // Curva compleja con nombre (z = e^(it)): no es una constante.
+                        Err(MathError("depende de t".into()))
                     } else {
-                        Ok(c.eval(0.0, 0.0))
+                        Ok(math::value_of(&c))
                     }
                 });
-                if let Ok(v) = res {
-                    env.constants.insert(name.clone(), v);
-                    progress = true;
+                match &res {
+                    Ok(z) if z.im == 0.0 => {
+                        env.constants.insert(name.clone(), z.re);
+                        progress = true;
+                    }
+                    Ok(z) => {
+                        env.complex.insert(name.clone(), *z);
+                        progress = true;
+                    }
+                    Err(_) => {}
                 }
                 const_results.insert(i, res);
             }
@@ -723,6 +736,15 @@ impl GraphApp {
                             }
                         });
                     }
+                    Kind::Points { value: Some(z), .. } => {
+                        ui.indent(item.id, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!("= {}", format_complex(*z))).strong().size(self.settings.expr_size * 0.9));
+                                let polar = format!("|z| = {}   arg = {}", format_number(z.norm()), format_number(z.arg()));
+                                ui.label(RichText::new(polar).size(self.settings.expr_size * 0.7).weak());
+                            });
+                        });
+                    }
                     Kind::Numbers(v) => {
                         let shown: Vec<String> = v.iter().take(12).map(|x| format_number(*x)).collect();
                         let more = if v.len() > 12 { format!(", … ({} elementos)", v.len()) } else { String::new() };
@@ -894,7 +916,11 @@ impl GraphApp {
             let p = self.view.to_screen(rect, hit.x, hit.y);
             painter.circle_filled(p, 5.5, hit.color);
             painter.circle_stroke(p, 5.5, Stroke::new(1.5, Color32::WHITE));
-            let text = format!("({}, {})", format_number(hit.x), format_number(hit.y));
+            let text = if hit.complex {
+                format_complex(C64::new(hit.x, hit.y))
+            } else {
+                format!("({}, {})", format_number(hit.x), format_number(hit.y))
+            };
             draw_tooltip(&painter, rect, p, text, hit.color, dark);
         }
 
@@ -1217,7 +1243,8 @@ impl GraphApp {
             }
             let d = self.view.to_screen(rect, x, y).distance(mouse);
             if d < 14.0 && best.as_ref().is_none_or(|b| d < b.0) {
-                best = Some((d, Hit { id: item.id, x, y, color: item.style.base_color(dark) }));
+                let complex = matches!(kind, Kind::Points { value: Some(_), .. });
+                best = Some((d, Hit { id: item.id, x, y, color: item.style.base_color(dark), complex }));
             }
         }
         best.map(|(_, h)| h)
@@ -1460,11 +1487,43 @@ struct Ctx<'a> {
     domain: (f64, f64),
 }
 
+/// Clasifica la línea y comprueba que ninguna gráfica real reciba valores complejos.
 fn classify(
     st: Statement,
     restrictions: &[Restriction],
     ctx: &Ctx,
-    const_result: Option<Result<f64, MathError>>,
+    const_result: Option<Result<C64, MathError>>,
+    list_result: Option<Result<ListValue, MathError>>,
+) -> Result<Kind, MathError> {
+    let kind = classify_inner(st, restrictions, ctx, const_result, list_result)?;
+    let leaks = match &kind {
+        Kind::Curve(c) => curve_leaks(c),
+        Kind::Ineq { curve, mask, .. } => curve_leaks(curve) || mask.as_ref().is_some_and(Compiled::leaks_complex),
+        _ => false,
+    };
+    if leaks {
+        return Err(MathError("da valores complejos: para graficarla usa re(…), im(…), abs(…) o arg(…)".into()));
+    }
+    Ok(kind)
+}
+
+fn curve_leaks(c: &Curve) -> bool {
+    match c {
+        Curve::Fx(f) | Curve::Fy(f) | Curve::Implicit(f) => f.leaks_complex(),
+        Curve::Param { x, y, .. } => x.leaks_complex() || y.leaks_complex(),
+    }
+}
+
+/// Punto del plano complejo que representa a `z`.
+fn complex_point(z: C64, name: Option<String>) -> Kind {
+    Kind::Points { pts: vec![(z.re, z.im)], name, drag: None, list: false, value: Some(z) }
+}
+
+fn classify_inner(
+    st: Statement,
+    restrictions: &[Restriction],
+    ctx: &Ctx,
+    const_result: Option<Result<C64, MathError>>,
     list_result: Option<Result<ListValue, MathError>>,
 ) -> Result<Kind, MathError> {
     let (env, domain) = (ctx.env, ctx.domain);
@@ -1528,6 +1587,27 @@ fn classify(
         }
     };
 
+    // Expresión compleja en t (o θ), como e^(it): curva t ↦ (re, im) en el plano complejo.
+    let complex_curve = |c: &Compiled| -> Option<Result<Kind, MathError>> {
+        if c.uses_x() || c.uses_y() || c.uses_r() || !(c.uses_t() || c.uses_theta()) {
+            return None;
+        }
+        Some((|| {
+            if c.uses_t() && c.uses_theta() {
+                return Err(MathError("usa un solo parámetro: t o θ".into()));
+            }
+            let (var, name) = if c.uses_t() { (Compiled::T, "t") } else { (Compiled::Theta, "θ") };
+            let conds = conds_param(&var)?;
+            let part = |f| param_to_x(&Compiled::F1(f, Box::new(c.clone())), &var);
+            Ok(Kind::Curve(Curve::Param {
+                x: math::restrict(part(math::Func1::Re), conds.clone(), CondPoint::Xy),
+                y: math::restrict(part(math::Func1::Im), conds, CondPoint::Xy),
+                t0: domain.0,
+                t1: domain.1,
+                var: name,
+            }))
+        })())
+    };
     // (x(t), y(t)): curva paramétrica, si las coordenadas usan t o θ.
     let param_curve = |items: &[Expr]| -> Option<Result<Kind, MathError>> {
         let [ex, ey] = items else { return None };
@@ -1561,7 +1641,7 @@ fn classify(
         let pts: Vec<(f64, f64)> = pts.into_iter().filter(|&(x, y)| math::conds_hold(&conds, x, y)).collect();
         let list = !matches!(expr, Expr::Tuple(_));
         let drag = if list { None } else { points::drag_spec(expr, ctx.sliders) };
-        Ok(Kind::Points { pts, name, drag, list })
+        Ok(Kind::Points { pts, name, drag, list, value: None })
     };
 
     Ok(match st {
@@ -1578,10 +1658,20 @@ fn classify(
             }
         }
         Statement::Constant { name, expr } => {
+            // z = e^(it): curva en el plano complejo con nombre.
+            if let Ok(c) = math::compile(&expr, env) {
+                if let Some(k) = complex_curve(&c) {
+                    return k;
+                }
+            }
             if restricted {
                 return not_graph();
             }
             let value = const_result.unwrap_or_else(|| Err(MathError("no se pudo evaluar".into())))?;
+            if value.im != 0.0 {
+                return Ok(complex_point(value, Some(name)));
+            }
+            let value = value.re;
             let is_literal = matches!(&expr, Expr::Num(_)) || matches!(&expr, Expr::Neg(inner) if matches!(**inner, Expr::Num(_)));
             if is_literal { Kind::Slider { name, value } } else { Kind::Value(value) }
         }
@@ -1680,7 +1770,10 @@ fn classify(
             } else if restricted {
                 return not_graph();
             } else {
-                Kind::Numbers(points::eval_numbers(&e, env, ctx.lists)?)
+                match points::eval_number_list(&e, env, ctx.lists)? {
+                    ListValue::Numbers(v) => Kind::Numbers(v),
+                    ListValue::Points(pts) => points_kind(pts, None, &e)?,
+                }
             }
         }
         Statement::Bare(e) => {
@@ -1688,12 +1781,16 @@ fn classify(
             if c.uses_y() {
                 return Err(MathError("usa una ecuación (con '=') para expresiones con y".into()));
             }
+            if let Some(k) = complex_curve(&c) {
+                return k;
+            }
             check_free(&c)?;
             // "3 {x > 0}" es una gráfica (y = 3 restringida), no un valor.
             if c.uses_x() || restricted {
                 Kind::Curve(restrict_curve(Curve::Fx(c), conds_xy()?))
             } else {
-                Kind::Value(c.eval(0.0, 0.0))
+                let z = math::value_of(&c);
+                if z.im == 0.0 { Kind::Value(z.re) } else { complex_point(z, None) }
             }
         }
     })
@@ -1736,6 +1833,20 @@ fn implicit(l: Compiled, r: Compiled) -> Result<Compiled, MathError> {
         return Err(MathError("no depende de x ni de y".into()));
     }
     Ok(f)
+}
+
+/// Complejo en forma binómica: 3 + 2i, -i, 0.5 - 1.25i…
+pub fn format_complex(z: C64) -> String {
+    if z.im == 0.0 || z.im.is_nan() && z.re.is_nan() {
+        return format_number(z.re);
+    }
+    let im_abs = z.im.abs();
+    let im = if im_abs == 1.0 { "i".to_string() } else { format!("{}i", format_number(im_abs)) };
+    match (z.re == 0.0, z.im < 0.0) {
+        (true, false) => im,
+        (true, true) => format!("-{im}"),
+        (false, neg) => format!("{} {} {im}", format_number(z.re), if neg { "-" } else { "+" }),
+    }
 }
 
 pub fn format_number(v: f64) -> String {
