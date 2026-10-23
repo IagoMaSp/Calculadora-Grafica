@@ -388,6 +388,9 @@ impl<'a> Parser<'a> {
         while self.eat(',') {
             args.push(self.parse_expr()?);
         }
+        if self.peek().is_none() {
+            return err("falta cerrar el paréntesis de la función: ')'");
+        }
         self.expect(')')?;
         Ok(args)
     }
@@ -400,7 +403,10 @@ impl<'a> Parser<'a> {
                 while self.eat(',') {
                     items.push(self.parse_expr()?);
                 }
-                self.expect(')')?;
+                // Un paréntesis de agrupación sin cerrar al final se cierra solo: "(x + 2".
+                if self.peek().is_some() {
+                    self.expect(')')?;
+                }
                 Ok(if items.len() == 1 { items.pop().unwrap() } else { Expr::Tuple(items) })
             }
             Some(Tok::Op('|')) => {
@@ -432,13 +438,30 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// sum(n, 1, 10, n^2), prod(…), int(u, 0, x, u^2): variable, desde, hasta, expresión.
+    /// sum(n, n^2, 1, 10), prod(…), int(u, u^2, 0, x): variable, expresión, desde, hasta.
+    /// int(x, f) (sin límites) es la primitiva ∫₀ˣ f, con constante 0.
     fn parse_big(&mut self, op: BigOp, name: &str) -> Result<Expr, MathError> {
-        let usage = format!("{name}(variable, desde, hasta, expresión), p. ej. {name}(n, 1, 10, n^2)");
+        let usage = match op {
+            BigOp::Int => "int(variable, función, desde, hasta), p. ej. int(x, x^2, 0, 1); o int(x, f) para la primitiva".to_string(),
+            _ => format!("{name}(variable, expresión, desde, hasta), p. ej. {name}(n, n^2, 1, 10)"),
+        };
         if !self.eat('(') {
             return err(usage);
         }
         let Some(Tok::Ident(var)) = self.next() else { return err(usage) };
+        if !self.eat(',') {
+            return err(usage);
+        }
+        let body = self.parse_big_body(&var)?;
+        // Primitiva: int(x, f) = ∫₀ˣ f(u) du (el límite superior es la x de fuera).
+        if op == BigOp::Int && matches!(self.peek(), Some(Tok::Op(')')) | None) {
+            if self.peek().is_none() {
+                return err("falta cerrar el paréntesis de int: ')'");
+            }
+            self.expect(')')?;
+            let to = Expr::Var(var.clone());
+            return Ok(Expr::Big { op, var, from: Box::new(Expr::Num(0.0)), to: Box::new(to), body: Box::new(body) });
+        }
         if !self.eat(',') {
             return err(usage);
         }
@@ -447,12 +470,28 @@ impl<'a> Parser<'a> {
             return err(usage);
         }
         let to = self.parse_expr()?;
-        if !self.eat(',') {
-            return err(usage);
+        if self.peek().is_none() {
+            return err(format!("falta cerrar el paréntesis de {name}: ')'"));
         }
-        let body = self.parse_expr()?;
         self.expect(')')?;
         Ok(Expr::Big { op, var, from: Box::new(from), to: Box::new(to), body: Box::new(body) })
+    }
+
+    /// Expresión de una suma/integral. Un nombre de función solo (f, sin…) se aplica a la
+    /// variable: int(x, f) = int(x, f(x)).
+    fn parse_big_body(&mut self, var: &str) -> Result<Expr, MathError> {
+        if let (Some(Tok::Ident(name)), Some(Tok::Op(',' | ')')) | None) = (self.toks.get(self.pos).cloned(), self.toks.get(self.pos + 1)) {
+            let arg = || Box::new(Expr::Var(var.to_string()));
+            if self.user_funcs.contains(&name) {
+                self.pos += 1;
+                return Ok(Expr::Call(name, vec![Expr::Var(var.to_string())]));
+            }
+            if let Some(&(_, f)) = FUNC1_NAMES.iter().find(|(n, _)| *n == name) {
+                self.pos += 1;
+                return Ok(Expr::F1(f, arg()));
+            }
+        }
+        self.parse_expr()
     }
 
     fn parse_ident(&mut self, name: String) -> Result<Expr, MathError> {
@@ -559,8 +598,9 @@ fn is_builtin_func(name: &str) -> bool {
     FUNC1_NAMES.iter().any(|(n, _)| *n == name) || FUNC2_NAMES.iter().any(|(n, _)| *n == name) || SPECIAL_FUNCS.contains(&name)
 }
 
-/// Variables reservadas además de x e y: parámetro `t`, ángulo `θ` y radio `r`.
-const RESERVED_VARS: &[&str] = &["t", "θ", "theta", "r"];
+/// Variables reservadas además de x e y: ángulo `θ` y radio `r` (de las polares).
+/// `t` no lo está: es el parámetro de las paramétricas salvo que el usuario lo defina.
+const RESERVED_VARS: &[&str] = &["θ", "theta", "r"];
 
 fn is_builtin_name(name: &str) -> bool {
     is_builtin_func(name) || CONSTANTS.iter().any(|(n, _)| *n == name) || name == "theta"
@@ -1362,7 +1402,8 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
                 Compiled::X
             } else if name == "y" {
                 Compiled::Y
-            } else if name == "t" {
+            } else if name == "t" && !env.constants.contains_key("t") && !env.complex.contains_key("t") {
+                // t es el parámetro de las paramétricas, salvo que el usuario lo defina.
                 Compiled::T
             } else if name == "θ" || name == "theta" {
                 Compiled::Theta
@@ -1619,7 +1660,13 @@ mod tests {
         });
         assert!((d.eval(0.0, 0.0) - 2.0).abs() < 1e-12);
         assert!(scan_definition("r = 2").is_none());
-        assert!(scan_definition("t = 2").is_none());
+        // t se puede definir (deslizador); entonces deja de ser el parámetro.
+        assert_eq!(scan_definition("t = 2"), Some(("t".to_string(), false)));
+        let mut env = Env::default();
+        env.constants.insert("t".into(), 2.0);
+        let c = compile(&parse_expr("3t", &none, &none).unwrap(), &env).unwrap();
+        assert!(!c.uses_t());
+        assert_eq!(c.eval(0.0, 0.0), 6.0);
     }
 
     #[test]
@@ -1661,16 +1708,16 @@ mod tests {
         let close = |a: f64, b: f64, tol: f64| (a - b).abs() <= tol * (1.0 + b.abs());
 
         // Sumatorias y productorias.
-        assert_eq!(at("sum(n, 1, 100, n)", 0.0), 5050.0);
-        assert_eq!(at("∑(k, 1, 4, k^2)", 0.0), 30.0);
-        assert_eq!(at("prod(n, 1, 5, n)", 0.0), 120.0);
-        assert_eq!(at("sum(n, 1, x, n)", 4.0), 10.0);
-        assert_eq!(at("sum(i, 1, 3, sum(j, 1, i, j))", 0.0), 10.0); // sumas anidadas
-        assert!(close(at("sum(n, 0, 20, x^n / n!)", 1.0), std::f64::consts::E, 1e-12));
+        assert_eq!(at("sum(n, n, 1, 100)", 0.0), 5050.0);
+        assert_eq!(at("∑(k, k^2, 1, 4)", 0.0), 30.0);
+        assert_eq!(at("prod(n, n, 1, 5)", 0.0), 120.0);
+        assert_eq!(at("sum(n, n, 1, x)", 4.0), 10.0);
+        assert_eq!(at("sum(i, sum(j, j, 1, i), 1, 3)", 0.0), 10.0); // sumas anidadas
+        assert!(close(at("sum(n, x^n / n!, 0, 20)", 1.0), std::f64::consts::E, 1e-12));
         // Integrales.
-        assert!(close(at("int(u, 0, 3, u^2)", 0.0), 9.0, 1e-10));
-        assert!(close(at("int(u, 0, x, cos(u))", 1.2), 1.2f64.sin(), 1e-10));
-        assert!(close(at("∫(u, 0, ∞, e^(-u))", 0.0), 1.0, 1e-8));
+        assert!(close(at("int(u, u^2, 0, 3)", 0.0), 9.0, 1e-10));
+        assert!(close(at("int(u, cos(u), 0, x)", 1.2), 1.2f64.sin(), 1e-10));
+        assert!(close(at("∫(u, e^(-u), 0, ∞)", 0.0), 1.0, 1e-8));
         // Derivadas.
         assert!(close(at("d/dx(x^3)", 2.0), 12.0, 1e-8));
         assert!(close(at("deriv(sin(x))", 0.5), 0.5f64.cos(), 1e-8));
@@ -1694,9 +1741,20 @@ mod tests {
         ));
         assert!(close(at("log(2, 8) + ln(e^2)", 0.0), 5.0, 1e-12));
         // Sumas con complejos.
-        let z = value_of(&compile(&parse_expr("sum(k, 0, 5, e^(i 2pi k/6))", &funcs, &funcs).unwrap(), &env).unwrap());
+        let z = value_of(&compile(&parse_expr("sum(k, e^(i 2pi k/6), 0, 5)", &funcs, &funcs).unwrap(), &env).unwrap());
         assert!(z.norm() < 1e-12);
+        // Primitiva con constante 0: int(x, f) y int(x, expresión).
+        assert!(close(at("int(x, f)", 2.0), 4.0, 1e-10)); // ∫₀² u³ du = 4
+        assert!(close(at("int(x, x^2)", 3.0), 9.0, 1e-10));
+        assert!(close(at("int(x, cos)", 1.0), 1f64.sin(), 1e-10));
+        assert!(close(at("int(x, f, 0, 1)", 0.0), 0.25, 1e-10));
+        assert!(close(at("sum(n, f, 1, 3)", 0.0), 36.0, 1e-12)); // 1 + 8 + 27
+        // Paréntesis de agrupación sin cerrar: se cierran solos; los de funciones no.
+        assert_eq!(at("(x + 2", 1.0), 3.0);
+        assert_eq!(at("2(x + (1", 1.0), 4.0);
+        assert!(parse_expr("sin(x", &funcs, &funcs).is_err());
+        assert!(parse_expr("int(x, f", &funcs, &funcs).is_err());
         // Errores útiles.
-        assert!(parse_expr("sum(n, 1, 10)", &funcs, &funcs).is_err());
+        assert!(parse_expr("sum(n, n^2, 1)", &funcs, &funcs).is_err());
     }
 }

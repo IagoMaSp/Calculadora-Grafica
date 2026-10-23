@@ -46,6 +46,15 @@ struct Item {
     slider_open: bool,
 }
 
+/// Acciones del menú contextual de una línea.
+#[derive(Clone, Copy)]
+enum RowAction {
+    Duplicate,
+    Up,
+    Down,
+    Delete,
+}
+
 /// Etiqueta de un punto.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 #[serde(default)]
@@ -147,7 +156,8 @@ struct AnimState {
 /// Interpretación de una línea, recalculada cuando cambia algún texto.
 enum Kind {
     Empty,
-    Error(String),
+    /// Error; `missing` son las variables sin definir (se ofrecen como deslizadores).
+    Error { msg: String, missing: Vec<String> },
     /// Constante calculada (o expresión sin x): se muestra su valor.
     Value(f64),
     Slider { name: String, value: f64 },
@@ -260,6 +270,9 @@ pub struct GraphApp {
     /// Última expresión que tuvo el cursor: ahí escribe el teclado.
     #[serde(skip)]
     last_edit: Option<u64>,
+    /// Líneas borradas (posición, línea), para deshacer.
+    #[serde(skip)]
+    deleted: Vec<(usize, Item)>,
     #[serde(skip)]
     help_open: bool,
     #[serde(skip)]
@@ -285,6 +298,7 @@ impl Default for GraphApp {
             keyboard_open: false,
             keyboard: KeyboardState::default(),
             last_edit: None,
+            deleted: Vec::new(),
             help_open: false,
             help_section: 0,
         };
@@ -486,15 +500,20 @@ impl GraphApp {
         for (i, p) in parsed.into_iter().enumerate() {
             let kind = match p {
                 None => Kind::Empty,
-                Some(Err(e)) => Kind::Error(e.0),
-                Some(Ok(_)) if dup.contains(&i) => Kind::Error("nombre ya definido en otra línea".into()),
+                Some(Err(e)) => Kind::Error { msg: e.0, missing: Vec::new() },
+                Some(Ok(_)) if dup.contains(&i) => Kind::Error { msg: "nombre ya definido en otra línea".into(), missing: Vec::new() },
                 Some(Ok((st, rs))) => {
                     let it = &self.items[i];
                     let (t0, t1) = it.domain.unwrap_or(DEFAULT_DOMAIN);
                     // Durante la animación de dibujo, la curva llega solo hasta el progreso actual.
                     let domain = if it.draw.active { (t0, t0 + (t1 - t0) * it.draw.progress.max(1e-9)) } else { (t0, t1) };
                     let ctx = Ctx { env: &env, lists: &lists, sliders: &sliders, domain };
-                    classify(st, &rs, &ctx, const_results.remove(&i), list_results.remove(&i)).unwrap_or_else(|e| Kind::Error(e.0))
+                    let free = points::statement_free_vars(&st, &rs);
+                    classify(st, &rs, &ctx, const_results.remove(&i), list_results.remove(&i)).unwrap_or_else(|e| {
+                        let mut missing: Vec<String> = free.into_iter().filter(|n| is_missing(n, &env, &lists)).collect();
+                        missing.sort();
+                        Kind::Error { msg: e.0, missing }
+                    })
                 }
             };
             kinds.push(kind);
@@ -608,6 +627,57 @@ impl GraphApp {
         }
     }
 
+    /// Atajos de teclado: F1 guía, Ctrl+K teclado, Ctrl+Z deshacer borrado (fuera de un campo).
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let editing = ctx.memory(|m| m.focused().is_some());
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, Key::F1) {
+                self.help_open = !self.help_open;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, Key::K) {
+                self.keyboard_open = !self.keyboard_open;
+            }
+            if !editing && i.consume_key(egui::Modifiers::COMMAND, Key::Z) {
+                self.undo_delete();
+            }
+        });
+    }
+
+    /// Borra una línea guardándola para poder deshacer.
+    fn delete_item(&mut self, idx: usize) {
+        let removed = self.items.remove(idx);
+        if self.selected == Some(removed.id) {
+            self.selected = None;
+        }
+        self.deleted.push((idx, removed));
+        if self.deleted.len() > 30 {
+            self.deleted.remove(0);
+        }
+        if self.items.is_empty() {
+            let id = self.push_item("");
+            self.focus_next = Some(id);
+        }
+        self.revision += 1;
+    }
+
+    /// Recupera la última línea borrada.
+    fn undo_delete(&mut self) {
+        let Some((idx, item)) = self.deleted.pop() else { return };
+        // Si solo queda una línea vacía (creada al borrar todo), se reemplaza.
+        if self.items.len() == 1 && self.items[0].text.trim().is_empty() {
+            self.items.clear();
+        }
+        let idx = idx.min(self.items.len());
+        self.items.insert(idx, item);
+        self.revision += 1;
+    }
+
+    /// Nombre parecido a `base` que no esté usado (f → f_2, a → a_2…).
+    fn free_name(&self, base: &str) -> String {
+        let used: HashSet<String> = self.items.iter().filter_map(|it| math::scan_definition(&it.text).map(|(n, _)| n)).collect();
+        (2..).map(|k| format!("{base}_{k}")).find(|n| !used.contains(n)).unwrap()
+    }
+
     /// Aplica una tecla del teclado en pantalla a la expresión que tenía el cursor
     /// (o a una nueva, si no había ninguna).
     fn apply_key(&mut self, ctx: &egui::Context, action: keyboard::Action) {
@@ -686,11 +756,14 @@ impl GraphApp {
         ui.horizontal(|ui| {
             ui.heading("Expresiones");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(RichText::new("❓").size(16.0)).on_hover_text("Guía de uso").clicked() {
+                if ui.button(RichText::new("❓").size(16.0)).on_hover_text("Guía de uso (F1)").clicked() {
                     self.help_open = true;
                 }
-                if ui.add(egui::Button::new(RichText::new("⌨").size(16.0)).selected(self.keyboard_open)).on_hover_text("Teclado").clicked() {
+                if ui.add(egui::Button::new(RichText::new("⌨").size(16.0)).selected(self.keyboard_open)).on_hover_text("Teclado (Ctrl+K)").clicked() {
                     self.keyboard_open = !self.keyboard_open;
+                }
+                if !self.deleted.is_empty() && ui.button(RichText::new("↶").size(16.0)).on_hover_text("Deshacer el borrado (Ctrl+Z)").clicked() {
+                    self.undo_delete();
                 }
                 let resp = ui.button(RichText::new("⚙").size(16.0)).on_hover_text("Ajustes");
                 egui::Popup::menu(&resp)
@@ -706,6 +779,8 @@ impl GraphApp {
 
         let mut remove = None;
         let mut add_after = None;
+        let mut add_sliders: Option<(usize, Vec<String>)> = None;
+        let mut row_action: Option<(usize, RowAction)> = None;
         let mut changed = false;
         let font = self.settings.expr_font();
         let row_h = self.settings.expr_size + 10.0;
@@ -741,8 +816,22 @@ impl GraphApp {
                             ui.visuals().weak_text_color(),
                         );
                     }
+                    // Clic derecho: acciones de la línea.
+                    resp.context_menu(|ui| {
+                        for (label, action) in [
+                            ("⧉  Duplicar", RowAction::Duplicate),
+                            ("⏶  Subir", RowAction::Up),
+                            ("⏷  Bajar", RowAction::Down),
+                            ("✕  Eliminar", RowAction::Delete),
+                        ] {
+                            if ui.button(label).clicked() {
+                                row_action = Some((idx, action));
+                                ui.close();
+                            }
+                        }
+                    });
                     if kind.is_graph() {
-                        let resp = resp.on_hover_text("Estilo y visibilidad");
+                        let resp = resp.on_hover_text("Estilo y visibilidad (clic derecho: más opciones)");
                         let target = EditorTarget {
                             has_line: kind.curve().is_some(),
                             has_fill: matches!(kind, Kind::Ineq { .. }),
@@ -807,9 +896,22 @@ impl GraphApp {
                 // Información bajo la expresión.
                 let small = self.settings.expr_size * 0.75;
                 match kind {
-                    Kind::Error(msg) => {
+                    Kind::Error { msg, missing } => {
                         ui.indent(item.id, |ui| {
                             ui.label(RichText::new(format!("⚠ {msg}")).color(ui.visuals().error_fg_color).size(small));
+                            if !missing.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("Crear deslizador:").size(small).weak());
+                                    for name in missing.iter().take(6) {
+                                        if ui.button(RichText::new(format!("＋ {name}")).size(small)).on_hover_text(format!("Añade {name} = 1")).clicked() {
+                                            add_sliders = Some((idx, vec![name.clone()]));
+                                        }
+                                    }
+                                    if missing.len() > 1 && ui.button(RichText::new("＋ todos").size(small)).clicked() {
+                                        add_sliders = Some((idx, missing.clone()));
+                                    }
+                                });
+                            }
                         });
                     }
                     Kind::Value(v) => {
@@ -856,21 +958,47 @@ impl GraphApp {
 
         });
 
+        if let Some((idx, names)) = add_sliders {
+            for (k, name) in names.iter().enumerate() {
+                let item = self.new_item(&format!("{name} = 1"));
+                self.items.insert(idx + 1 + k, item);
+            }
+            changed = true;
+        }
         if let Some(idx) = add_after {
             let item = self.new_item("");
             self.focus_next = Some(item.id);
             self.items.insert(idx + 1, item);
             changed = true;
         }
+        match row_action {
+            Some((idx, RowAction::Delete)) => remove = Some(idx),
+            Some((idx, RowAction::Duplicate)) => {
+                let mut copy = self.new_item(&self.items[idx].text.clone());
+                copy.style = self.items[idx].style;
+                copy.slider = self.items[idx].slider;
+                copy.domain = self.items[idx].domain;
+                copy.label = self.items[idx].label.clone();
+                // Una definición duplicada chocaría con la original: se renombra.
+                if let Some((name, _)) = math::scan_definition(&copy.text) {
+                    let new_name = self.free_name(&name);
+                    copy.text = copy.text.replacen(&name, &new_name, 1);
+                }
+                self.items.insert(idx + 1, copy);
+                changed = true;
+            }
+            Some((idx, RowAction::Up)) if idx > 0 => {
+                self.items.swap(idx, idx - 1);
+                changed = true;
+            }
+            Some((idx, RowAction::Down)) if idx + 1 < self.items.len() => {
+                self.items.swap(idx, idx + 1);
+                changed = true;
+            }
+            _ => {}
+        }
         if let Some(idx) = remove {
-            let removed = self.items.remove(idx);
-            if self.selected == Some(removed.id) {
-                self.selected = None;
-            }
-            if self.items.is_empty() {
-                let id = self.push_item("");
-                self.focus_next = Some(id);
-            }
+            self.delete_item(idx);
             changed = true;
         }
         if changed {
@@ -1541,6 +1669,20 @@ fn point_extras_ui(ui: &mut egui::Ui, item: &mut Item, name: Option<&str>, singl
     changed
 }
 
+/// ¿`name` es una variable sin definir (candidata a deslizador)?
+fn is_missing(name: &str, env: &Env, lists: &Lists) -> bool {
+    const KNOWN: &[&str] = &["x", "y", "θ", "theta", "r", "i", "e", "pi", "π", "tau", "τ", "inf"];
+    name.chars().next().is_some_and(char::is_alphabetic)
+        && !name.contains('.')
+        && !KNOWN.contains(&name)
+        && !env.constants.contains_key(name)
+        && !env.complex.contains_key(name)
+        && !env.funcs.contains_key(name)
+        && !env.points.contains(name)
+        && !lists.numbers.contains_key(name)
+        && !lists.points.contains_key(name)
+}
+
 /// Id del campo de texto de una expresión (para que el teclado sepa dónde escribir).
 fn expr_edit_id(item_id: u64) -> egui::Id {
     egui::Id::unique(("expresion", item_id))
@@ -1958,6 +2100,7 @@ pub fn format_number(v: f64) -> String {
 impl eframe::App for GraphApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(&ui.ctx().clone());
+        self.shortcuts(ui.ctx());
         self.analyze();
         self.animate(&ui.ctx().clone());
         self.analyze();
@@ -1965,7 +2108,7 @@ impl eframe::App for GraphApp {
         // Teclado abajo, a todo el ancho.
         if self.keyboard_open {
             let mut action = None;
-            egui::Panel::bottom("teclado").resizable(false).exact_size(300.0).show(ui, |ui| {
+            egui::Panel::bottom("teclado").resizable(false).exact_size(262.0).show(ui, |ui| {
                 action = keyboard::keyboard_ui(ui, &mut self.keyboard, &mut self.keyboard_open);
             });
             if let Some(a) = action {
@@ -2036,5 +2179,55 @@ mod tests {
         app.apply_key(&ctx, ins("α", 0));
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.items[1].text, "α");
+    }
+
+    fn app_with(lines: &[&str]) -> GraphApp {
+        let mut app = GraphApp::default();
+        app.items.clear();
+        for l in lines {
+            app.push_item(l);
+        }
+        app.analyze();
+        app
+    }
+
+    #[test]
+    fn qol_behaviour() {
+        // Variables sin definir: se ofrecen como deslizadores.
+        let app = app_with(&["y = a x + b c"]);
+        let Kind::Error { missing, .. } = &app.kinds[0] else { panic!("debería ser un error") };
+        assert_eq!(missing, &vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // Los parámetros de funciones y las variables ligadas no cuentan.
+        let app = app_with(&["f(u) = u k", "sum(n, n m, 1, 3)"]);
+        let Kind::Error { missing, .. } = &app.kinds[0] else { panic!() };
+        assert_eq!(missing, &vec!["k".to_string()]);
+        let Kind::Error { missing, .. } = &app.kinds[1] else { panic!() };
+        assert_eq!(missing, &vec!["m".to_string()]);
+
+        // t puede ser un deslizador; sin definirlo sigue siendo el parámetro.
+        let app = app_with(&["t = 2", "y = t x", "(cos(t), sin(t))"]);
+        assert!(matches!(app.kinds[0], Kind::Slider { .. }));
+        assert!(matches!(app.kinds[1], Kind::Curve(Curve::Fx(_))));
+        assert!(matches!(app.kinds[2], Kind::Points { .. })); // con t definido, es un punto
+        let app = app_with(&["(cos(t), sin(t))"]);
+        assert!(matches!(app.kinds[0], Kind::Curve(Curve::Param { .. })));
+
+        // Paréntesis de agrupación sin cerrar.
+        let app = app_with(&["y = (x + 2", "y = sin(x"]);
+        assert!(matches!(app.kinds[0], Kind::Curve(_)));
+        assert!(matches!(app.kinds[1], Kind::Error { .. }));
+
+        // Primitiva de una función con nombre.
+        let app = app_with(&["f(x) = 2x", "y = int(x, f)"]);
+        let Kind::Curve(Curve::Fx(c)) = &app.kinds[1] else { panic!() };
+        assert!((c.eval(3.0, 0.0) - 9.0).abs() < 1e-9);
+
+        // Duplicar renombra las definiciones; borrar se puede deshacer.
+        let mut app = app_with(&["a = 1", "y = a x"]);
+        assert_eq!(app.free_name("a"), "a_2");
+        app.delete_item(1);
+        assert_eq!(app.items.len(), 1);
+        app.undo_delete();
+        assert_eq!(app.items[1].text, "y = a x");
     }
 }
