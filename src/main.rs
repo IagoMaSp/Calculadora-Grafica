@@ -5,6 +5,7 @@ mod analysis;
 mod app;
 mod help;
 mod keyboard;
+mod latex;
 mod math;
 mod plot;
 mod points;

@@ -10,6 +10,7 @@ use eframe::egui::{
 use crate::analysis::{self, Curve, Poi};
 use crate::help;
 use crate::keyboard::{self, KeyboardState};
+use crate::latex;
 use crate::math::{self, C64, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::points::{self, Coord, ListValue, Lists};
@@ -279,6 +280,10 @@ pub struct GraphApp {
     /// Líneas borradas (posición, línea), para deshacer.
     #[serde(skip)]
     deleted: Vec<(usize, Item)>,
+    /// Si es falso, no se guarda la sesión al cerrar (al abrir con expresiones por
+    /// línea de comandos, para no reemplazar la sesión guardada).
+    #[serde(skip)]
+    persist: bool,
     #[serde(skip)]
     help_open: bool,
     #[serde(skip)]
@@ -306,6 +311,7 @@ impl Default for GraphApp {
             keyboard: KeyboardState::default(),
             last_edit: None,
             deleted: Vec::new(),
+            persist: true,
             help_open: false,
             help_section: 0,
         };
@@ -334,6 +340,7 @@ impl GraphApp {
             .unwrap_or_default();
         app.revision = 1;
         if !initial.is_empty() {
+            app.persist = false;
             app.items.clear();
             app.next_id = 0;
             for text in &initial {
@@ -384,11 +391,18 @@ impl GraphApp {
         }
         self.analyzed_revision = Some(self.revision);
 
+        // 0) Las líneas en LaTeX (\frac{x}{2}…) se traducen a la sintaxis de la app.
+        let sources: Vec<Result<String, MathError>> = self
+            .items
+            .iter()
+            .map(|it| if latex::is_latex(&it.text) { latex::to_plain(&it.text) } else { Ok(it.text.clone()) })
+            .collect();
+
         // 1) Nombres definidos en todas las líneas.
         let mut user_funcs = HashSet::new();
         let mut user_names = HashSet::new();
-        for it in &self.items {
-            if let Some((name, is_func)) = math::scan_definition(&it.text) {
+        for src in sources.iter().flatten() {
+            if let Some((name, is_func)) = math::scan_definition(src) {
                 if is_func {
                     user_funcs.insert(name.clone());
                 }
@@ -397,12 +411,14 @@ impl GraphApp {
         }
 
         // 2) Parseo de cada línea.
-        let parsed: Vec<Option<Result<(Statement, Vec<Restriction>), MathError>>> = self
-            .items
+        let parsed: Vec<Option<Result<(Statement, Vec<Restriction>), MathError>>> = sources
             .iter()
-            .map(|it| {
-                let t = it.text.trim();
-                (!t.is_empty()).then(|| math::parse_statement(t, &user_funcs, &user_names))
+            .map(|src| match src {
+                Ok(t) => {
+                    let t = t.trim();
+                    (!t.is_empty()).then(|| math::parse_statement(t, &user_funcs, &user_names))
+                }
+                Err(e) => Some(Err(e.clone())),
             })
             .collect();
 
@@ -2193,6 +2209,9 @@ impl eframe::App for GraphApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if !self.persist {
+            return;
+        }
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
 }
@@ -2281,5 +2300,16 @@ mod tests {
         assert_eq!(app.items.len(), 1);
         app.undo_delete();
         assert_eq!(app.items[1].text, "y = a x");
+    }
+
+    #[test]
+    fn latex_lines() {
+        let app = app_with(&[r"f(x) = \frac{x^2}{2}", r"y = f(x) + \sqrt{x}", r"\sum_{n=1}^{4} n", r"\frac{1}{2"]);
+        assert!(matches!(app.kinds[0], Kind::Curve(Curve::Fx(_))));
+        let Kind::Curve(Curve::Fx(c)) = &app.kinds[1] else { panic!("{:?}", app.items[1].text) };
+        assert!((c.eval(4.0, 0.0) - 10.0).abs() < 1e-12);
+        assert!(matches!(app.kinds[2], Kind::Value(v) if v == 10.0));
+        assert!(matches!(app.kinds[3], Kind::Error { .. }));
+        assert!(app.pretty[0].is_some());
     }
 }
