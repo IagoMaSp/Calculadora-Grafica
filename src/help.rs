@@ -45,6 +45,7 @@ const SECTIONS: &[Section] = &[
                 ("F1", "abrir esta guía"),
                 ("Ctrl+K", "mostrar u ocultar el teclado en pantalla"),
                 ("Enter", "nueva línea debajo"),
+                ("Ctrl+S / Ctrl+O", "guardar el proyecto / abrir otro"),
             ]),
         ],
     },
@@ -318,6 +319,50 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: "Textos en la gráfica",
+        blocks: &[
+            P("Puedes escribir textos sobre la gráfica para explicar lo que se ve: el nombre de una curva, un paso de un ejercicio, una conclusión…"),
+            H("Añadir un texto"),
+            Table(&[
+                ("Botón T (en la gráfica)", "actívalo y haz clic donde quieras poner el texto; Esc cancela"),
+                ("Clic derecho en la gráfica", "\"Añadir texto aquí\""),
+            ]),
+            P("El texto aparece listo para escribir. Enter hace un salto de línea; haz clic fuera para terminar (un texto vacío se descarta)."),
+            H("Editar y mover"),
+            Table(&[
+                ("Arrastrar", "mueve el texto (se queda en ese lugar del plano al desplazar o acercar)"),
+                ("Doble clic", "editarlo directamente en la gráfica"),
+                ("La T de su línea", "color, tamaño, fondo y visibilidad"),
+            ]),
+            P("Cada texto también es una línea del panel (marcada con una T): ahí puedes editarlo, duplicarlo, moverlo de orden o borrarlo como cualquier expresión."),
+            H("Valores que se actualizan"),
+            P("Escribe una expresión entre llaves y el texto muestra su valor, que cambia al mover los deslizadores o los puntos."),
+            Table(&[
+                ("a = {a}", "a = 0.5 (el valor del deslizador a)"),
+                ("Área: {a^2 pi}", "una cuenta con tus variables"),
+                ("A está en {A}", "las coordenadas del punto A"),
+            ]),
+        ],
+    },
+    Section {
+        title: "Proyectos e imágenes",
+        blocks: &[
+            P("Lo que tienes en pantalla se guarda solo al cerrar la aplicación, pero además puedes guardar cada trabajo como un proyecto aparte (un archivo .agraf) y abrirlo cuando quieras."),
+            H("Menú 📁 (arriba del panel)"),
+            Table(&[
+                ("Nuevo (Ctrl+N)", "empieza un proyecto vacío"),
+                ("Abrir… (Ctrl+O)", "abre un proyecto guardado; también puedes soltar el archivo sobre la ventana"),
+                ("Recientes", "los últimos proyectos que abriste o guardaste"),
+                ("Guardar (Ctrl+S)", "guarda en el archivo del proyecto (la primera vez pide el nombre)"),
+                ("Guardar como… (Ctrl+Mayús+S)", "guarda una copia con otro nombre"),
+                ("Exportar imagen PNG… (Ctrl+E)", "guarda la gráfica como imagen"),
+                ("Copiar imagen", "copia la gráfica al portapapeles para pegarla en otro programa"),
+            ]),
+            P("El título de la ventana muestra el nombre del proyecto; un ● delante indica que hay cambios sin guardar. Si abres otro proyecto o empiezas uno nuevo con cambios pendientes, se te pregunta si quieres guardarlos."),
+            Tip("La imagen exportada es exactamente la zona de la gráfica que ves, sin los botones ni las marcas de selección. Ajusta la vista y el tamaño de la ventana antes de exportar."),
+        ],
+    },
+    Section {
         title: "Puntos notables",
         blocks: &[
             P("Haz clic en una curva (o en su expresión) para seleccionarla. Aparecen puntos grises en sus lugares importantes:"),
@@ -362,7 +407,7 @@ const SECTIONS: &[Section] = &[
                 ("Puntos notables", "activarlos o desactivarlos"),
                 ("Escritura matemática", "mostrar las expresiones con formato matemático o como texto"),
             ]),
-            P("Tus expresiones, estilos y ajustes se guardan automáticamente al cerrar la aplicación."),
+            P("Tus expresiones, estilos y ajustes se guardan automáticamente al cerrar la aplicación. Para tener varios trabajos separados, usa los proyectos (menú 📁)."),
         ],
     },
 ];
