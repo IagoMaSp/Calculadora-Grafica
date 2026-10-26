@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::special;
+
 pub use num_complex::Complex64 as C64;
 
 // ───────────────────────────── Errores ─────────────────────────────
@@ -57,6 +59,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, MathError> {
             let s: String = chars[start..i].iter().collect();
             let v = s.parse::<f64>().map_err(|_| MathError(format!("número inválido: {s}")))?;
             out.push(Tok::Num(v));
+        } else if chars[i..].starts_with(&['d', '/', 'd', 'x']) && !chars.get(i + 4).is_some_and(|c| c.is_alphanumeric()) {
+            // d/dx(…): derivada respecto de x.
+            out.push(Tok::Ident("deriv".into()));
+            i += 4;
         } else if c.is_alphabetic() || c == '_' {
             let start = i;
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -72,11 +78,19 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, MathError> {
                 '·' | '×' => '*',
                 '÷' => '/',
                 '−' => '-',
-                '√' => {
-                    out.push(Tok::Ident("sqrt".into()));
+                '√' | '∑' | '∏' | '∫' | '∞' => {
+                    let name = match c {
+                        '√' => "sqrt",
+                        '∑' => "sum",
+                        '∏' => "prod",
+                        '∫' => "int",
+                        _ => "inf",
+                    };
+                    out.push(Tok::Ident(name.into()));
                     i += 1;
                     continue;
                 }
+                '\'' | '′' => '\'',
                 '.' if chars[i..].starts_with(&['.', '.', '.']) => {
                     out.push(Tok::Op('…'));
                     i += 3;
@@ -84,7 +98,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, MathError> {
                 }
                 // Campo de un punto con nombre: A.x, A.y
                 '.' if chars.get(i + 1).is_some_and(|d| d.is_alphabetic()) => '.',
-                '+' | '-' | '*' | '/' | '^' | '(' | ')' | ',' | '|' | '=' | '!' | '[' | ']' | '…' => c,
+                '+' | '-' | '*' | '/' | '^' | '(' | ')' | ',' | '|' | '=' | '!' | '[' | ']' | '…' | ';' => c,
                 _ => return err(format!("carácter inesperado '{c}'")),
             };
             out.push(Tok::Op(op));
@@ -103,6 +117,9 @@ pub enum Func1 {
     Sinh, Cosh, Tanh,
     Sqrt, Cbrt, Abs, Ln, Log, Exp,
     Floor, Ceil, Round, Sign, Fact,
+    Asec, Acsc, Acot,
+    Asinh, Acosh, Atanh, Sech, Csch, Coth,
+    Gamma, LnGamma, Erf, Erfc, LambertW, Trunc,
     /// Parte real, parte imaginaria, argumento y conjugado de un complejo.
     Re, Im, Arg, Conj,
     /// Módulo de un complejo (|z|); el compilador lo usa en vez de Abs si hace falta.
@@ -113,6 +130,9 @@ pub enum Func1 {
 pub enum Func2 {
     Add, Sub, Mul, Div, Pow,
     Min, Max, Mod, Atan2, LogBase, Root,
+    NCr, NPr, Gcd, Lcm, Beta,
+    /// W(k, x): rama k (0 o −1) de la función W de Lambert.
+    LambertWk,
 }
 
 const FUNC1_NAMES: &[(&str, Func1)] = &[
@@ -124,6 +144,14 @@ const FUNC1_NAMES: &[(&str, Func1)] = &[
     ("sqrt", Func1::Sqrt), ("cbrt", Func1::Cbrt), ("abs", Func1::Abs),
     ("ln", Func1::Ln), ("log", Func1::Log), ("exp", Func1::Exp),
     ("floor", Func1::Floor), ("ceil", Func1::Ceil), ("round", Func1::Round), ("sign", Func1::Sign),
+    ("asec", Func1::Asec), ("arcsec", Func1::Asec), ("acsc", Func1::Acsc), ("arccsc", Func1::Acsc),
+    ("acot", Func1::Acot), ("arccot", Func1::Acot),
+    ("asinh", Func1::Asinh), ("arcsinh", Func1::Asinh), ("arsinh", Func1::Asinh),
+    ("acosh", Func1::Acosh), ("arccosh", Func1::Acosh), ("arcosh", Func1::Acosh),
+    ("atanh", Func1::Atanh), ("arctanh", Func1::Atanh), ("artanh", Func1::Atanh),
+    ("sech", Func1::Sech), ("csch", Func1::Csch), ("coth", Func1::Coth),
+    ("gamma", Func1::Gamma), ("Γ", Func1::Gamma), ("lgamma", Func1::LnGamma), ("lngamma", Func1::LnGamma),
+    ("erf", Func1::Erf), ("erfc", Func1::Erfc), ("lambertw", Func1::LambertW), ("trunc", Func1::Trunc),
     ("re", Func1::Re), ("real", Func1::Re), ("im", Func1::Im), ("imag", Func1::Im),
     ("arg", Func1::Arg), ("conj", Func1::Conj),
 ];
@@ -131,6 +159,8 @@ const FUNC1_NAMES: &[(&str, Func1)] = &[
 const FUNC2_NAMES: &[(&str, Func2)] = &[
     ("min", Func2::Min), ("max", Func2::Max), ("mod", Func2::Mod),
     ("atan2", Func2::Atan2), ("logb", Func2::LogBase), ("root", Func2::Root),
+    ("nCr", Func2::NCr), ("comb", Func2::NCr), ("binom", Func2::NCr), ("nPr", Func2::NPr), ("perm", Func2::NPr),
+    ("gcd", Func2::Gcd), ("mcd", Func2::Gcd), ("lcm", Func2::Lcm), ("mcm", Func2::Lcm), ("beta", Func2::Beta),
 ];
 
 const CONSTANTS: &[(&str, f64)] = &[
@@ -139,7 +169,37 @@ const CONSTANTS: &[(&str, f64)] = &[
     ("tau", std::f64::consts::TAU),
     ("τ", std::f64::consts::TAU),
     ("e", std::f64::consts::E),
+    ("inf", f64::INFINITY),
 ];
+
+/// Nombre con el que se muestra una función de un argumento.
+pub fn func1_display(f: Func1) -> &'static str {
+    match f {
+        Func1::Asin => "arcsin",
+        Func1::Acos => "arccos",
+        Func1::Atan => "arctan",
+        Func1::Asec => "arcsec",
+        Func1::Acsc => "arccsc",
+        Func1::Acot => "arccot",
+        Func1::Asinh => "arsinh",
+        Func1::Acosh => "arcosh",
+        Func1::Atanh => "artanh",
+        Func1::Gamma => "Γ",
+        Func1::LnGamma => "ln Γ",
+        Func1::LambertW => "W",
+        Func1::Fact => "!",
+        Func1::CAbs => "abs",
+        _ => FUNC1_NAMES.iter().find(|(_, g)| *g == f).map_or("?", |(n, _)| n),
+    }
+}
+
+/// Nombre con el que se muestra una función de dos argumentos.
+pub fn func2_display(f: Func2) -> &'static str {
+    FUNC2_NAMES.iter().find(|(_, g)| *g == f).map_or("?", |(n, _)| n)
+}
+
+/// Funciones con sintaxis propia (no van en las tablas de arriba).
+const SPECIAL_FUNCS: &[&str] = &["sum", "prod", "int", "integral", "deriv", "diff"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -160,6 +220,19 @@ pub enum Expr {
     Range(Box<Expr>, Option<Box<Expr>>, Box<Expr>),
     /// `cuerpo for var = lista`: el cuerpo evaluado para cada valor de la lista.
     For { body: Box<Expr>, var: String, list: Box<Expr> },
+    /// Sumatoria, productoria o integral de `body` con `var` entre `from` y `to`.
+    Big { op: BigOp, var: String, from: Box<Expr>, to: Box<Expr>, body: Box<Expr> },
+    /// Derivada de `body` respecto de x, de orden `order`: d/dx(…).
+    Deriv { body: Box<Expr>, order: u32 },
+    /// f'(arg), f''(arg)…: derivada de una función de usuario evaluada en `arg`.
+    Prime { name: String, order: u32, arg: Box<Expr> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BigOp {
+    Sum,
+    Prod,
+    Int,
 }
 
 /// Condición `lhs <op> rhs` de una restricción `{…}`.
@@ -341,6 +414,9 @@ impl<'a> Parser<'a> {
         while self.eat(',') {
             args.push(self.parse_expr()?);
         }
+        if self.peek().is_none() {
+            return err("falta cerrar el paréntesis de la función: ')'");
+        }
         self.expect(')')?;
         Ok(args)
     }
@@ -353,7 +429,10 @@ impl<'a> Parser<'a> {
                 while self.eat(',') {
                     items.push(self.parse_expr()?);
                 }
-                self.expect(')')?;
+                // Un paréntesis de agrupación sin cerrar al final se cierra solo: "(x + 2".
+                if self.peek().is_some() {
+                    self.expect(')')?;
+                }
                 Ok(if items.len() == 1 { items.pop().unwrap() } else { Expr::Tuple(items) })
             }
             Some(Tok::Op('|')) => {
@@ -385,8 +464,108 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// sum(n, n^2, 1, 10), prod(…), int(u, u^2, 0, x): variable, expresión, desde, hasta.
+    /// int(x, f) (sin límites) es la primitiva ∫₀ˣ f, con constante 0.
+    fn parse_big(&mut self, op: BigOp, name: &str) -> Result<Expr, MathError> {
+        let usage = match op {
+            BigOp::Int => "int(variable, función, desde, hasta), p. ej. int(x, x^2, 0, 1); o int(x, f) para la primitiva".to_string(),
+            _ => format!("{name}(variable, expresión, desde, hasta), p. ej. {name}(n, n^2, 1, 10)"),
+        };
+        if !self.eat('(') {
+            return err(usage);
+        }
+        let Some(Tok::Ident(var)) = self.next() else { return err(usage) };
+        if !self.eat(',') {
+            return err(usage);
+        }
+        let body = self.parse_big_body(&var)?;
+        // Primitiva: int(x, f) = ∫₀ˣ f(u) du (el límite superior es la x de fuera).
+        if op == BigOp::Int && matches!(self.peek(), Some(Tok::Op(')')) | None) {
+            if self.peek().is_none() {
+                return err("falta cerrar el paréntesis de int: ')'");
+            }
+            self.expect(')')?;
+            let to = Expr::Var(var.clone());
+            return Ok(Expr::Big { op, var, from: Box::new(Expr::Num(0.0)), to: Box::new(to), body: Box::new(body) });
+        }
+        if !self.eat(',') {
+            return err(usage);
+        }
+        let from = self.parse_expr()?;
+        if !self.eat(',') {
+            return err(usage);
+        }
+        let to = self.parse_expr()?;
+        if self.peek().is_none() {
+            return err(format!("falta cerrar el paréntesis de {name}: ')'"));
+        }
+        self.expect(')')?;
+        Ok(Expr::Big { op, var, from: Box::new(from), to: Box::new(to), body: Box::new(body) })
+    }
+
+    /// Expresión de una suma/integral. Un nombre de función solo (f, sin…) se aplica a la
+    /// variable: int(x, f) = int(x, f(x)).
+    fn parse_big_body(&mut self, var: &str) -> Result<Expr, MathError> {
+        if let (Some(Tok::Ident(name)), Some(Tok::Op(',' | ')')) | None) = (self.toks.get(self.pos).cloned(), self.toks.get(self.pos + 1)) {
+            let arg = || Box::new(Expr::Var(var.to_string()));
+            if self.user_funcs.contains(&name) {
+                self.pos += 1;
+                return Ok(Expr::Call(name, vec![Expr::Var(var.to_string())]));
+            }
+            if let Some(&(_, f)) = FUNC1_NAMES.iter().find(|(n, _)| *n == name) {
+                self.pos += 1;
+                return Ok(Expr::F1(f, arg()));
+            }
+        }
+        self.parse_expr()
+    }
+
     fn parse_ident(&mut self, name: String) -> Result<Expr, MathError> {
         let has_paren = self.peek() == Some(&Tok::Op('('));
+
+        match name.as_str() {
+            "sum" => return self.parse_big(BigOp::Sum, "sum"),
+            "prod" => return self.parse_big(BigOp::Prod, "prod"),
+            "int" | "integral" => return self.parse_big(BigOp::Int, "int"),
+            "deriv" | "diff" => {
+                let body = if has_paren {
+                    let mut args = self.parse_args()?;
+                    if args.len() != 1 {
+                        return err("d/dx(expresión): derivada respecto de x");
+                    }
+                    args.pop().unwrap()
+                } else {
+                    self.parse_bare_arg()?
+                };
+                return Ok(Expr::Deriv { body: Box::new(body), order: 1 });
+            }
+            // W(x) y W(k, x): función W de Lambert (si W no es un nombre del usuario).
+            "W" if has_paren && !self.user_names.contains("W") => {
+                let mut args = self.parse_args()?;
+                return match args.len() {
+                    1 => Ok(Expr::F1(Func1::LambertW, Box::new(args.pop().unwrap()))),
+                    2 => {
+                        let x = args.pop().unwrap();
+                        let k = args.pop().unwrap();
+                        Ok(Expr::bin(Func2::LambertWk, k, x))
+                    }
+                    _ => err("W(x) o W(k, x)"),
+                };
+            }
+            _ => {}
+        }
+        // f'(x), f''(x)…
+        if self.user_funcs.contains(&name) && self.peek() == Some(&Tok::Op('\'')) {
+            let mut order = 0;
+            while self.eat('\'') {
+                order += 1;
+            }
+            let mut args = self.parse_args()?;
+            if args.len() != 1 {
+                return err(format!("{name}' solo existe para funciones de una variable"));
+            }
+            return Ok(Expr::Prime { name, order, arg: Box::new(args.pop().unwrap()) });
+        }
 
         if let Some(&(_, f)) = FUNC1_NAMES.iter().find(|(n, _)| *n == name) {
             // sin^2(x) = (sin x)^2
@@ -442,11 +621,12 @@ fn apply_power(e: Expr, power: Option<Expr>) -> Expr {
 }
 
 fn is_builtin_func(name: &str) -> bool {
-    FUNC1_NAMES.iter().any(|(n, _)| *n == name) || FUNC2_NAMES.iter().any(|(n, _)| *n == name)
+    FUNC1_NAMES.iter().any(|(n, _)| *n == name) || FUNC2_NAMES.iter().any(|(n, _)| *n == name) || SPECIAL_FUNCS.contains(&name)
 }
 
-/// Variables reservadas además de x e y: parámetro `t`, ángulo `θ` y radio `r`.
-const RESERVED_VARS: &[&str] = &["t", "θ", "theta", "r"];
+/// Variables reservadas además de x e y: ángulo `θ` y radio `r` (de las polares).
+/// `t` no lo está: es el parámetro de las paramétricas salvo que el usuario lo defina.
+const RESERVED_VARS: &[&str] = &["θ", "theta", "r"];
 
 fn is_builtin_name(name: &str) -> bool {
     is_builtin_func(name) || CONSTANTS.iter().any(|(n, _)| *n == name) || name == "theta"
@@ -463,7 +643,9 @@ pub fn parse_expr(src: &str, user_funcs: &HashSet<String>, user_names: &HashSet<
     match p.peek() {
         None => Ok(e),
         Some(Tok::Op(')')) => err("paréntesis ')' de más"),
-        Some(t) => err(format!("no se esperaba {t:?}")),
+        Some(Tok::Op(c)) => err(format!("no se esperaba '{c}' aquí")),
+        Some(Tok::Num(v)) => err(format!("no se esperaba el número {v} aquí")),
+        Some(Tok::Ident(n)) => err(format!("no se esperaba '{n}' aquí")),
     }
 }
 
@@ -695,6 +877,12 @@ pub enum Compiled {
     Neg(Box<Compiled>),
     F1(Func1, Box<Compiled>),
     F2(Func2, Box<Compiled>, Box<Compiled>),
+    /// Variable ligada de una suma, integral o derivada: posición en la pila de evaluación.
+    Bound(usize),
+    /// Suma / producto / integral de `body` con `Bound(idx)` entre `from` y `to`.
+    Big { op: BigOp, idx: usize, from: Box<Compiled>, to: Box<Compiled>, body: Box<Compiled> },
+    /// Derivada de orden 1 o 2 de `body` respecto de `Bound(idx)`, evaluada en `at`.
+    Deriv { idx: usize, order: u32, body: Box<Compiled>, at: Box<Compiled> },
     /// `value` si se cumplen las condiciones (cada una como `lhs - rhs`), si no NaN.
     /// `sub` indica en qué punto se evalúan las condiciones.
     Cond { value: Box<Compiled>, conds: Vec<(Compiled, Comparison)>, sub: CondPoint },
@@ -720,25 +908,107 @@ pub fn conds_hold(conds: &[(Compiled, Comparison)], x: f64, y: f64) -> bool {
     conds.iter().all(|(c, cmp)| cmp.holds(c.eval(x, y)))
 }
 
+/// Rango entero [lo, hi] de una suma/producto (con límites redondeados). None si está
+/// vacío, no es finito o tiene más de un millón de términos.
+fn int_range(a: f64, b: f64) -> Option<(i64, i64)> {
+    if !(a.is_finite() && b.is_finite()) {
+        return None;
+    }
+    let (lo, hi) = (a.round(), b.round());
+    (hi >= lo && hi - lo <= 1e6).then_some((lo as i64, hi as i64))
+}
+
+/// Máximo de variables ligadas anidadas (sumas dentro de sumas…).
+const MAX_BOUND: usize = 16;
+type Stack = [f64; MAX_BOUND];
+
+/// Paso para derivar numéricamente en `a` (fórmulas de 5 puntos).
+fn deriv_step(a: f64) -> f64 {
+    1e-3 * a.abs().max(1.0)
+}
+
+/// Derivada numérica de orden 1 o 2 con diferencias centradas de 5 puntos (error O(h⁴)).
+fn finite_diff<T>(f: &mut dyn FnMut(f64) -> T, a: f64, order: u32) -> T
+where
+    T: Copy + std::ops::Add<Output = T> + std::ops::Sub<Output = T> + std::ops::Mul<f64, Output = T>,
+{
+    let h = deriv_step(a);
+    let (f2p, f1p, f1m, f2m) = (f(a + 2.0 * h), f(a + h), f(a - h), f(a - 2.0 * h));
+    if order == 1 {
+        (f1p - f1m) * (8.0 / (12.0 * h)) - (f2p - f2m) * (1.0 / (12.0 * h))
+    } else {
+        let f0 = f(a);
+        ((f1p + f1m) * 16.0 - (f2p + f2m) - f0 * 30.0) * (1.0 / (12.0 * h * h))
+    }
+}
+
 impl Compiled {
     #[inline]
     pub fn eval(&self, x: f64, y: f64) -> f64 {
+        self.ev(x, y, &mut [0.0; MAX_BOUND])
+    }
+
+    fn ev(&self, x: f64, y: f64, s: &mut Stack) -> f64 {
         match self {
             Compiled::Num(v) => *v,
             Compiled::CNum(re, im) => if *im == 0.0 { *re } else { f64::NAN },
             Compiled::X => x,
             Compiled::Y => y,
+            Compiled::Bound(i) => s[*i],
             Compiled::T | Compiled::Theta | Compiled::R => f64::NAN,
-            Compiled::Neg(a) => -a.eval(x, y),
+            Compiled::Neg(a) => -a.ev(x, y, s),
             // Funciones que extraen un real de un complejo: el argumento se evalúa en complejo.
             Compiled::F1(f @ (Func1::Re | Func1::Im | Func1::Arg | Func1::Conj | Func1::CAbs), a) => {
-                let z = apply1_c(*f, a.eval_c(x, y));
+                let z = apply1_c(*f, a.ev_c(x, y, s));
                 if z.im == 0.0 { z.re } else { f64::NAN }
             }
-            Compiled::F1(f, a) => apply1(*f, a.eval(x, y)),
-            Compiled::F2(f, a, b) => apply2(*f, a.eval(x, y), b.eval(x, y)),
+            Compiled::F1(f, a) => apply1(*f, a.ev(x, y, s)),
+            Compiled::F2(f, a, b) => apply2(*f, a.ev(x, y, s), b.ev(x, y, s)),
+            Compiled::Big { op, idx, from, to, body } => {
+                let (a, b) = (from.ev(x, y, s), to.ev(x, y, s));
+                let saved = s[*idx];
+                let v = match op {
+                    BigOp::Sum | BigOp::Prod => match int_range(a, b) {
+                        Some((lo, hi)) => {
+                            let mut acc = if *op == BigOp::Sum { 0.0 } else { 1.0 };
+                            for k in lo..=hi {
+                                s[*idx] = k as f64;
+                                let t = body.ev(x, y, s);
+                                if *op == BigOp::Sum { acc += t } else { acc *= t }
+                            }
+                            acc
+                        }
+                        None if a.is_finite() && b.is_finite() => if *op == BigOp::Sum { 0.0 } else { 1.0 },
+                        None => f64::NAN,
+                    },
+                    BigOp::Int => special::integrate(
+                        &mut |u| {
+                            s[*idx] = u;
+                            body.ev(x, y, s)
+                        },
+                        a,
+                        b,
+                    ),
+                };
+                s[*idx] = saved;
+                v
+            }
+            Compiled::Deriv { idx, order, body, at } => {
+                let a = at.ev(x, y, s);
+                let saved = s[*idx];
+                let v = finite_diff(
+                    &mut |u| {
+                        s[*idx] = u;
+                        body.ev(x, y, s)
+                    },
+                    a,
+                    *order,
+                );
+                s[*idx] = saved;
+                v
+            }
             Compiled::Cond { value, conds, sub } => {
-                let v = value.eval(x, y);
+                let v = value.ev(x, y, s);
                 let (px, py) = match sub {
                     CondPoint::Xy => (x, y),
                     CondPoint::ValueIsY => (x, v),
@@ -751,17 +1021,77 @@ impl Compiled {
 
     /// Evaluación en números complejos (las condiciones se comprueban con la parte real).
     pub fn eval_c(&self, x: f64, y: f64) -> C64 {
+        self.ev_c(x, y, &mut [0.0; MAX_BOUND])
+    }
+
+    fn ev_c(&self, x: f64, y: f64, s: &mut Stack) -> C64 {
         match self {
             Compiled::Num(v) => C64::new(*v, 0.0),
             Compiled::CNum(re, im) => C64::new(*re, *im),
             Compiled::X => C64::new(x, 0.0),
             Compiled::Y => C64::new(y, 0.0),
+            Compiled::Bound(i) => C64::new(s[*i], 0.0),
             Compiled::T | Compiled::Theta | Compiled::R => C64::new(f64::NAN, 0.0),
-            Compiled::Neg(a) => -a.eval_c(x, y),
-            Compiled::F1(f, a) => apply1_c(*f, a.eval_c(x, y)),
-            Compiled::F2(f, a, b) => apply2_c(*f, a.eval_c(x, y), b.eval_c(x, y)),
+            Compiled::Neg(a) => -a.ev_c(x, y, s),
+            Compiled::F1(f, a) => apply1_c(*f, a.ev_c(x, y, s)),
+            Compiled::F2(f, a, b) => apply2_c(*f, a.ev_c(x, y, s), b.ev_c(x, y, s)),
+            Compiled::Big { op, idx, from, to, body } => {
+                // Los límites son reales; el cuerpo puede ser complejo.
+                let (a, b) = (from.ev(x, y, s), to.ev(x, y, s));
+                let saved = s[*idx];
+                let v = match op {
+                    BigOp::Sum | BigOp::Prod => match int_range(a, b) {
+                        Some((lo, hi)) => {
+                            let mut acc = C64::new(if *op == BigOp::Sum { 0.0 } else { 1.0 }, 0.0);
+                            for k in lo..=hi {
+                                s[*idx] = k as f64;
+                                let t = body.ev_c(x, y, s);
+                                if *op == BigOp::Sum { acc += t } else { acc *= t }
+                            }
+                            acc
+                        }
+                        None if a.is_finite() && b.is_finite() => C64::new(if *op == BigOp::Sum { 0.0 } else { 1.0 }, 0.0),
+                        None => C64::new(f64::NAN, 0.0),
+                    },
+                    BigOp::Int => {
+                        let re = special::integrate(
+                            &mut |u| {
+                                s[*idx] = u;
+                                body.ev_c(x, y, s).re
+                            },
+                            a,
+                            b,
+                        );
+                        let im = special::integrate(
+                            &mut |u| {
+                                s[*idx] = u;
+                                body.ev_c(x, y, s).im
+                            },
+                            a,
+                            b,
+                        );
+                        C64::new(re, im)
+                    }
+                };
+                s[*idx] = saved;
+                v
+            }
+            Compiled::Deriv { idx, order, body, at } => {
+                let a = at.ev(x, y, s);
+                let saved = s[*idx];
+                let v = finite_diff(
+                    &mut |u| {
+                        s[*idx] = u;
+                        body.ev_c(x, y, s)
+                    },
+                    a,
+                    *order,
+                );
+                s[*idx] = saved;
+                v
+            }
             Compiled::Cond { value, conds, sub } => {
-                let v = value.eval_c(x, y);
+                let v = value.ev_c(x, y, s);
                 let (px, py) = match sub {
                     CondPoint::Xy => (x, y),
                     CondPoint::ValueIsY => (x, v.re),
@@ -788,6 +1118,8 @@ impl Compiled {
             Compiled::Neg(a) | Compiled::F1(_, a) => a.leaks_complex(),
             Compiled::F2(_, a, b) => a.leaks_complex() || b.leaks_complex(),
             Compiled::Cond { value, conds, .. } => value.leaks_complex() || conds.iter().any(|(c, _)| c.leaks_complex()),
+            Compiled::Big { from, to, body, .. } => from.leaks_complex() || to.leaks_complex() || body.leaks_complex(),
+            Compiled::Deriv { body, at, .. } => body.leaks_complex() || at.leaks_complex(),
             _ => false,
         }
     }
@@ -826,6 +1158,16 @@ impl Compiled {
                 conds: conds.iter().map(|(c, cmp)| (c.subst(f), *cmp)).collect(),
                 sub: *sub,
             },
+            Compiled::Big { op, idx, from, to, body } => Compiled::Big {
+                op: *op,
+                idx: *idx,
+                from: Box::new(from.subst(f)),
+                to: Box::new(to.subst(f)),
+                body: Box::new(body.subst(f)),
+            },
+            Compiled::Deriv { idx, order, body, at } => {
+                Compiled::Deriv { idx: *idx, order: *order, body: Box::new(body.subst(f)), at: Box::new(at.subst(f)) }
+            }
             other => other.clone(),
         };
         fold(c)
@@ -836,8 +1178,26 @@ impl Compiled {
                 Compiled::Neg(a) | Compiled::F1(_, a) => a.any(pred),
                 Compiled::F2(_, a, b) => a.any(pred) || b.any(pred),
                 Compiled::Cond { value, conds, .. } => value.any(pred) || conds.iter().any(|(c, _)| c.any(pred)),
+                Compiled::Big { from, to, body, .. } => from.any(pred) || to.any(pred) || body.any(pred),
+                Compiled::Deriv { body, at, .. } => body.any(pred) || at.any(pred),
                 _ => false,
             }
+    }
+
+    /// Mayor índice de variable ligada que aparece en el árbol.
+    fn max_bound(&self) -> Option<usize> {
+        let own = if let Compiled::Bound(i) = self { Some(*i) } else { None };
+        let kids: Vec<Option<usize>> = match self {
+            Compiled::Neg(a) | Compiled::F1(_, a) => vec![a.max_bound()],
+            Compiled::F2(_, a, b) => vec![a.max_bound(), b.max_bound()],
+            Compiled::Cond { value, conds, .. } => {
+                std::iter::once(value.max_bound()).chain(conds.iter().map(|(c, _)| c.max_bound())).collect()
+            }
+            Compiled::Big { from, to, body, .. } => vec![from.max_bound(), to.max_bound(), body.max_bound()],
+            Compiled::Deriv { body, at, .. } => vec![body.max_bound(), at.max_bound()],
+            _ => Vec::new(),
+        };
+        own.into_iter().chain(kids.into_iter().flatten()).max()
     }
 }
 
@@ -868,7 +1228,22 @@ fn apply1(f: Func1, v: f64) -> f64 {
         Func1::Sign => {
             if v == 0.0 { 0.0 } else { v.signum() }
         }
-        Func1::Fact => gamma(v + 1.0),
+        Func1::Fact => libm::tgamma(v + 1.0),
+        Func1::Asec => (1.0 / v).acos(),
+        Func1::Acsc => (1.0 / v).asin(),
+        Func1::Acot => if v == 0.0 { std::f64::consts::FRAC_PI_2 } else { (1.0 / v).atan() },
+        Func1::Asinh => v.asinh(),
+        Func1::Acosh => v.acosh(),
+        Func1::Atanh => v.atanh(),
+        Func1::Sech => 1.0 / v.cosh(),
+        Func1::Csch => 1.0 / v.sinh(),
+        Func1::Coth => 1.0 / v.tanh(),
+        Func1::Gamma => libm::tgamma(v),
+        Func1::LnGamma => libm::lgamma(v),
+        Func1::Erf => libm::erf(v),
+        Func1::Erfc => libm::erfc(v),
+        Func1::LambertW => special::lambert_w(v, 0),
+        Func1::Trunc => v.trunc(),
         Func1::Re | Func1::Conj => v,
         Func1::Im => if v.is_nan() { v } else { 0.0 },
         Func1::Arg => if v < 0.0 { std::f64::consts::PI } else if v.is_nan() { v } else { 0.0 },
@@ -930,7 +1305,22 @@ fn apply1_c(f: Func1, z: C64) -> C64 {
         Func1::Round => real_only(z, f64::round),
         // sign(z) = z / |z|
         Func1::Sign => if z == C64::new(0.0, 0.0) { z } else { z / z.norm() },
-        Func1::Fact => real_only(z, |v| gamma(v + 1.0)),
+        Func1::Fact => real_only(z, |v| libm::tgamma(v + 1.0)),
+        Func1::Asec => (one / z).acos(),
+        Func1::Acsc => (one / z).asin(),
+        Func1::Acot => if z == C64::new(0.0, 0.0) { C64::new(std::f64::consts::FRAC_PI_2, 0.0) } else { (one / z).atan() },
+        Func1::Asinh => z.asinh(),
+        Func1::Acosh => if z.im == 0.0 && z.re >= 1.0 { C64::new(z.re.acosh(), 0.0) } else { z.acosh() },
+        Func1::Atanh => z.atanh(),
+        Func1::Sech => one / z.cosh(),
+        Func1::Csch => one / z.sinh(),
+        Func1::Coth => one / z.tanh(),
+        Func1::Gamma => real_only(z, libm::tgamma),
+        Func1::LnGamma => real_only(z, libm::lgamma),
+        Func1::Erf => real_only(z, libm::erf),
+        Func1::Erfc => real_only(z, libm::erfc),
+        Func1::LambertW => real_only(z, |v| special::lambert_w(v, 0)),
+        Func1::Trunc => real_only(z, f64::trunc),
         Func1::Re => C64::new(z.re, 0.0),
         Func1::Im => C64::new(z.im, 0.0),
         Func1::Arg => C64::new(z.arg(), 0.0),
@@ -952,6 +1342,12 @@ fn apply2_c(f: Func2, a: C64, b: C64) -> C64 {
         Func2::Atan2 => real2(f64::atan2),
         Func2::LogBase => b.ln() / a.ln(),
         Func2::Root => cpow(b, C64::new(1.0, 0.0) / a),
+        Func2::NCr => real2(special::ncr),
+        Func2::NPr => real2(special::npr),
+        Func2::Gcd => real2(special::gcd),
+        Func2::Lcm => real2(special::lcm),
+        Func2::Beta => real2(special::beta),
+        Func2::LambertWk => real2(|k, x| if k == 0.0 || k == -1.0 { special::lambert_w(x, k as i32) } else { f64::NAN }),
     }
 }
 
@@ -981,6 +1377,12 @@ fn apply2(f: Func2, a: f64, b: f64) -> f64 {
         Func2::Atan2 => a.atan2(b),
         Func2::LogBase => b.ln() / a.ln(),
         Func2::Root => pow(b, 1.0 / a),
+        Func2::NCr => special::ncr(a, b),
+        Func2::NPr => special::npr(a, b),
+        Func2::Gcd => special::gcd(a, b),
+        Func2::Lcm => special::lcm(a, b),
+        Func2::Beta => special::beta(a, b),
+        Func2::LambertWk => if a == 0.0 || a == -1.0 { special::lambert_w(b, a as i32) } else { f64::NAN },
     }
 }
 
@@ -998,25 +1400,6 @@ fn pow(a: f64, b: f64) -> f64 {
         }
     }
     f64::NAN
-}
-
-/// Función gamma (aproximación de Lanczos), para el factorial.
-fn gamma(x: f64) -> f64 {
-    if x < 0.5 {
-        return std::f64::consts::PI / ((std::f64::consts::PI * x).sin() * gamma(1.0 - x));
-    }
-    const G: [f64; 9] = [
-        0.999_999_999_999_809_9, 676.520_368_121_885_1, -1_259.139_216_722_402_8,
-        771.323_428_777_653_1, -176.615_029_162_140_6, 12.507_343_278_686_905,
-        -0.138_571_095_265_720_12, 9.984_369_578_019_572e-6, 1.505_632_735_149_311_6e-7,
-    ];
-    let x = x - 1.0;
-    let mut a = G[0];
-    let t = x + 7.5;
-    for (i, g) in G.iter().enumerate().skip(1) {
-        a += g / (x + i as f64);
-    }
-    (2.0 * std::f64::consts::PI).sqrt() * t.powf(x + 0.5) * (-t).exp() * a
 }
 
 /// Entorno de definiciones globales usado al compilar.
@@ -1047,7 +1430,8 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
                 Compiled::X
             } else if name == "y" {
                 Compiled::Y
-            } else if name == "t" {
+            } else if name == "t" && !env.constants.contains_key("t") && !env.complex.contains_key("t") {
+                // t es el parámetro de las paramétricas, salvo que el usuario lo defina.
                 Compiled::T
             } else if name == "θ" || name == "theta" {
                 Compiled::Theta
@@ -1095,6 +1479,34 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
         }
         Expr::Tuple(_) => return err("los puntos (a, b) solo pueden ir solos en una línea"),
         Expr::List(_) | Expr::Range(..) | Expr::For { .. } => return err("las listas solo pueden ir solas en una línea"),
+        Expr::Big { op, var, from, to, body } => {
+            let from = compile_scoped(from, env, locals, depth)?;
+            let to = compile_scoped(to, env, locals, depth)?;
+            let (idx, inner) = bind(locals, var)?;
+            let body = compile_scoped(body, env, &inner, depth)?;
+            Compiled::Big { op: *op, idx, from: Box::new(from), to: Box::new(to), body: Box::new(body) }
+        }
+        // d/dx(cuerpo): el cuerpo se compila con x como variable ligada y se evalúa en x.
+        Expr::Deriv { body, order } => {
+            let (idx, inner) = bind(locals, "x")?;
+            let body = compile_scoped(body, env, &inner, depth)?;
+            let at = locals.get("x").cloned().unwrap_or(Compiled::X);
+            nest_deriv(idx, *order, body, at)
+        }
+        // f'(arg): el cuerpo de f con su parámetro como variable ligada, evaluado en arg.
+        Expr::Prime { name, order, arg } => {
+            let Some((params, body)) = env.funcs.get(name) else {
+                return err(format!("función '{name}' no definida"));
+            };
+            if params.len() != 1 {
+                return err(format!("{name}' solo existe para funciones de una variable"));
+            }
+            let at = compile_scoped(arg, env, locals, depth)?;
+            let idx = next_bound(locals)?;
+            let inner = HashMap::from([(params[0].clone(), Compiled::Bound(idx))]);
+            let body = compile_scoped(body, env, &inner, depth + 1)?;
+            nest_deriv(idx, *order, body, at)
+        }
         Expr::Restrict(body, rs) => {
             let value = compile_scoped(body, env, locals, depth)?;
             let conds = rs
@@ -1109,6 +1521,36 @@ fn compile_scoped(e: &Expr, env: &Env, locals: &HashMap<String, Compiled>, depth
         }
     };
     Ok(fold(c))
+}
+
+/// Siguiente posición libre de la pila de variables ligadas.
+fn next_bound(locals: &HashMap<String, Compiled>) -> Result<usize, MathError> {
+    let idx = locals.values().filter_map(Compiled::max_bound).max().map_or(0, |m| m + 1);
+    if idx >= MAX_BOUND {
+        return err("demasiadas sumas, integrales o derivadas anidadas");
+    }
+    Ok(idx)
+}
+
+/// Nuevo ámbito con `var` como variable ligada.
+fn bind(locals: &HashMap<String, Compiled>, var: &str) -> Result<(usize, HashMap<String, Compiled>), MathError> {
+    let idx = next_bound(locals)?;
+    let mut inner = locals.clone();
+    inner.insert(var.to_string(), Compiled::Bound(idx));
+    Ok((idx, inner))
+}
+
+/// Derivada de orden n: se encadenan derivadas de orden 2 y 1 (respecto de la misma variable).
+fn nest_deriv(idx: usize, order: u32, body: Compiled, at: Compiled) -> Compiled {
+    match order {
+        0 => body.subst(&|c| (*c == Compiled::Bound(idx)).then(|| at.clone())),
+        1 | 2 => Compiled::Deriv { idx, order, body: Box::new(body), at: Box::new(at) },
+        n => {
+            // f⁽ⁿ⁾(a) = (f⁽ⁿ⁻²⁾)''(a): la interior se evalúa en la variable ligada.
+            let inner = nest_deriv(idx, n - 2, body, Compiled::Bound(idx));
+            Compiled::Deriv { idx, order: 2, body: Box::new(inner), at: Box::new(at) }
+        }
+    }
 }
 
 /// Plegado de constantes: evalúa subárboles que no dependen de x ni y.
@@ -1246,7 +1688,13 @@ mod tests {
         });
         assert!((d.eval(0.0, 0.0) - 2.0).abs() < 1e-12);
         assert!(scan_definition("r = 2").is_none());
-        assert!(scan_definition("t = 2").is_none());
+        // t se puede definir (deslizador); entonces deja de ser el parámetro.
+        assert_eq!(scan_definition("t = 2"), Some(("t".to_string(), false)));
+        let mut env = Env::default();
+        env.constants.insert("t".into(), 2.0);
+        let c = compile(&parse_expr("3t", &none, &none).unwrap(), &env).unwrap();
+        assert!(!c.uses_t());
+        assert_eq!(c.eval(0.0, 0.0), 6.0);
     }
 
     #[test]
@@ -1277,5 +1725,64 @@ mod tests {
         let mut env = Env::default();
         env.constants.insert("i".into(), 3.0);
         assert_eq!(value_of(&compile(&parse_expr("2i", &none, &none).unwrap(), &env).unwrap()), C64::new(6.0, 0.0));
+    }
+    #[test]
+    fn calculus_and_special() {
+        let funcs: HashSet<String> = ["f".to_string()].into();
+        let mut env = Env::default();
+        let (Statement::FuncDef { name, params, body }, _) = parse_statement("f(u) = u^3", &funcs, &funcs).unwrap() else { panic!() };
+        env.funcs.insert(name, (params, body));
+        let at = |src: &str, x: f64| compile(&parse_expr(src, &funcs, &funcs).unwrap(), &env).unwrap().eval(x, 0.0);
+        let close = |a: f64, b: f64, tol: f64| (a - b).abs() <= tol * (1.0 + b.abs());
+
+        // Sumatorias y productorias.
+        assert_eq!(at("sum(n, n, 1, 100)", 0.0), 5050.0);
+        assert_eq!(at("∑(k, k^2, 1, 4)", 0.0), 30.0);
+        assert_eq!(at("prod(n, n, 1, 5)", 0.0), 120.0);
+        assert_eq!(at("sum(n, n, 1, x)", 4.0), 10.0);
+        assert_eq!(at("sum(i, sum(j, j, 1, i), 1, 3)", 0.0), 10.0); // sumas anidadas
+        assert!(close(at("sum(n, x^n / n!, 0, 20)", 1.0), std::f64::consts::E, 1e-12));
+        // Integrales.
+        assert!(close(at("int(u, u^2, 0, 3)", 0.0), 9.0, 1e-10));
+        assert!(close(at("int(u, cos(u), 0, x)", 1.2), 1.2f64.sin(), 1e-10));
+        assert!(close(at("∫(u, e^(-u), 0, ∞)", 0.0), 1.0, 1e-8));
+        // Derivadas.
+        assert!(close(at("d/dx(x^3)", 2.0), 12.0, 1e-8));
+        assert!(close(at("deriv(sin(x))", 0.5), 0.5f64.cos(), 1e-8));
+        assert!(close(at("f'(x)", 2.0), 12.0, 1e-8));
+        assert!(close(at("f''(x)", 2.0), 12.0, 1e-6));
+        assert!(close(at("f'''(x)", 2.0), 6.0, 1e-4));
+        assert!(close(at("f'(2)", 0.0), 12.0, 1e-8)); // valor constante
+        assert!(close(at("d/dx(d/dx(x^4))", 1.0), 12.0, 1e-5));
+        // Funciones especiales.
+        assert_eq!(at("nCr(5, 2) + nPr(5, 2)", 0.0), 30.0);
+        assert!(close(at("gamma(5)", 0.0), 24.0, 1e-12));
+        assert!(close(at("Γ(0.5)^2", 0.0), std::f64::consts::PI, 1e-12));
+        assert!(close(at("W(1)", 0.0), 0.567_143_290_409_783_8, 1e-13));
+        assert!(close(at("W(-1, -0.2)", 0.0), -2.542_641_357_773_527, 1e-12));
+        assert!(close(at("erf(1)", 0.0), 0.842_700_792_949_714_9, 1e-12));
+        assert_eq!(at("floor(2.7) + ceil(2.1) + mod(7, 3) + gcd(12, 18) + lcm(4, 6)", 0.0), 2.0 + 3.0 + 1.0 + 6.0 + 12.0);
+        assert!(close(
+            at("asinh(1) + acosh(2) + atanh(0.5) + coth(1) + sech(0) + acot(1)", 0.0),
+            1f64.asinh() + 2f64.acosh() + 0.5f64.atanh() + 1.0 / 1f64.tanh() + 1.0 + std::f64::consts::FRAC_PI_4,
+            1e-12
+        ));
+        assert!(close(at("log(2, 8) + ln(e^2)", 0.0), 5.0, 1e-12));
+        // Sumas con complejos.
+        let z = value_of(&compile(&parse_expr("sum(k, e^(i 2pi k/6), 0, 5)", &funcs, &funcs).unwrap(), &env).unwrap());
+        assert!(z.norm() < 1e-12);
+        // Primitiva con constante 0: int(x, f) y int(x, expresión).
+        assert!(close(at("int(x, f)", 2.0), 4.0, 1e-10)); // ∫₀² u³ du = 4
+        assert!(close(at("int(x, x^2)", 3.0), 9.0, 1e-10));
+        assert!(close(at("int(x, cos)", 1.0), 1f64.sin(), 1e-10));
+        assert!(close(at("int(x, f, 0, 1)", 0.0), 0.25, 1e-10));
+        assert!(close(at("sum(n, f, 1, 3)", 0.0), 36.0, 1e-12)); // 1 + 8 + 27
+        // Paréntesis de agrupación sin cerrar: se cierran solos; los de funciones no.
+        assert_eq!(at("(x + 2", 1.0), 3.0);
+        assert_eq!(at("2(x + (1", 1.0), 4.0);
+        assert!(parse_expr("sin(x", &funcs, &funcs).is_err());
+        assert!(parse_expr("int(x, f", &funcs, &funcs).is_err());
+        // Errores útiles.
+        assert!(parse_expr("sum(n, n^2, 1)", &funcs, &funcs).is_err());
     }
 }

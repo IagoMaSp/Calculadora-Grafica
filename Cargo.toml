@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "0.37.0", features = ["persistence", "glow"] }
+libm = "0.2.16"
 num-complex = "0.4.6"
 serde = { version = "1.0.229", features = ["derive"] }
 

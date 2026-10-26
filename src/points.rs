@@ -53,6 +53,31 @@ pub fn is_number_list(e: &Expr, lists: &Lists) -> bool {
     }
 }
 
+/// Variables libres de una línea (sin contar parámetros de funciones ni variables de
+/// sumas, integrales o comprensiones). Sirve para ofrecer deslizadores de lo no definido.
+pub fn statement_free_vars(st: &math::Statement, rs: &[math::Restriction]) -> HashSet<String> {
+    use math::Statement;
+    let mut out = HashSet::new();
+    match st {
+        Statement::Constant { expr, .. } | Statement::Bare(expr) => collect_vars(expr, &mut out),
+        Statement::FuncDef { params, body, .. } => {
+            collect_vars(body, &mut out);
+            for p in params {
+                out.remove(p);
+            }
+        }
+        Statement::Equation { lhs, rhs } | Statement::Inequality { lhs, rhs, .. } => {
+            collect_vars(lhs, &mut out);
+            collect_vars(rhs, &mut out);
+        }
+    }
+    for r in rs {
+        collect_vars(&r.lhs, &mut out);
+        collect_vars(&r.rhs, &mut out);
+    }
+    out
+}
+
 fn collect_vars(e: &Expr, out: &mut HashSet<String>) {
     match e {
         Expr::Num(_) => {}
@@ -86,6 +111,16 @@ fn collect_vars(e: &Expr, out: &mut HashSet<String>) {
             out.extend(inner);
             collect_vars(list, out);
         }
+        Expr::Big { var, from, to, body, .. } => {
+            collect_vars(from, out);
+            collect_vars(to, out);
+            let mut inner = HashSet::new();
+            collect_vars(body, &mut inner);
+            inner.remove(var);
+            out.extend(inner);
+        }
+        Expr::Deriv { body, .. } => collect_vars(body, out),
+        Expr::Prime { arg, .. } => collect_vars(arg, out),
     }
 }
 

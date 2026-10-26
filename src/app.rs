@@ -9,9 +9,12 @@ use eframe::egui::{
 
 use crate::analysis::{self, Curve, Poi};
 use crate::help;
+use crate::keyboard::{self, KeyboardState};
+use crate::latex;
 use crate::math::{self, C64, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::points::{self, Coord, ListValue, Lists};
+use crate::pretty;
 use crate::style::{self, EditorTarget, LineStyle, Style};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -43,6 +46,15 @@ struct Item {
     /// ¿Se muestran los ajustes del deslizador (rango, paso, velocidad)?
     #[serde(skip)]
     slider_open: bool,
+}
+
+/// Acciones del menú contextual de una línea.
+#[derive(Clone, Copy)]
+enum RowAction {
+    Duplicate,
+    Up,
+    Down,
+    Delete,
 }
 
 /// Etiqueta de un punto.
@@ -146,7 +158,8 @@ struct AnimState {
 /// Interpretación de una línea, recalculada cuando cambia algún texto.
 enum Kind {
     Empty,
-    Error(String),
+    /// Error; `missing` son las variables sin definir (se ofrecen como deslizadores).
+    Error { msg: String, missing: Vec<String> },
     /// Constante calculada (o expresión sin x): se muestra su valor.
     Value(f64),
     Slider { name: String, value: f64 },
@@ -212,11 +225,13 @@ struct Settings {
     /// Tamaño de los números de los ejes.
     label_size: f32,
     show_pois: bool,
+    /// Mostrar las expresiones con escritura matemática (exponentes arriba, fracciones…).
+    pretty_math: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: ThemeChoice::Light, expr_size: 19.0, monospace: false, label_size: 13.0, show_pois: true }
+        Self { theme: ThemeChoice::Light, expr_size: 19.0, monospace: false, label_size: 13.0, show_pois: true, pretty_math: true }
     }
 }
 
@@ -237,6 +252,9 @@ pub struct GraphApp {
     revision: u64,
     #[serde(skip)]
     kinds: Vec<Kind>,
+    /// Escritura matemática de cada línea (si se pudo leer).
+    #[serde(skip)]
+    pretty: Vec<Option<pretty::Node>>,
     #[serde(skip)]
     analyzed_revision: Option<u64>,
     #[serde(skip)]
@@ -253,6 +271,19 @@ pub struct GraphApp {
     /// Punto que se está arrastrando.
     #[serde(skip)]
     dragging: Option<u64>,
+    /// Teclado en pantalla.
+    keyboard_open: bool,
+    keyboard: KeyboardState,
+    /// Última expresión que tuvo el cursor: ahí escribe el teclado.
+    #[serde(skip)]
+    last_edit: Option<u64>,
+    /// Líneas borradas (posición, línea), para deshacer.
+    #[serde(skip)]
+    deleted: Vec<(usize, Item)>,
+    /// Si es falso, no se guarda la sesión al cerrar (al abrir con expresiones por
+    /// línea de comandos, para no reemplazar la sesión guardada).
+    #[serde(skip)]
+    persist: bool,
     #[serde(skip)]
     help_open: bool,
     #[serde(skip)]
@@ -268,6 +299,7 @@ impl Default for GraphApp {
             settings: Settings::default(),
             revision: 1,
             kinds: Vec::new(),
+            pretty: Vec::new(),
             analyzed_revision: None,
             geometry: None,
             pois: None,
@@ -275,6 +307,11 @@ impl Default for GraphApp {
             focus_next: None,
             theme_applied: None,
             dragging: None,
+            keyboard_open: false,
+            keyboard: KeyboardState::default(),
+            last_edit: None,
+            deleted: Vec::new(),
+            persist: true,
             help_open: false,
             help_section: 0,
         };
@@ -303,6 +340,7 @@ impl GraphApp {
             .unwrap_or_default();
         app.revision = 1;
         if !initial.is_empty() {
+            app.persist = false;
             app.items.clear();
             app.next_id = 0;
             for text in &initial {
@@ -353,11 +391,18 @@ impl GraphApp {
         }
         self.analyzed_revision = Some(self.revision);
 
+        // 0) Las líneas en LaTeX (\frac{x}{2}…) se traducen a la sintaxis de la app.
+        let sources: Vec<Result<String, MathError>> = self
+            .items
+            .iter()
+            .map(|it| if latex::is_latex(&it.text) { latex::to_plain(&it.text) } else { Ok(it.text.clone()) })
+            .collect();
+
         // 1) Nombres definidos en todas las líneas.
         let mut user_funcs = HashSet::new();
         let mut user_names = HashSet::new();
-        for it in &self.items {
-            if let Some((name, is_func)) = math::scan_definition(&it.text) {
+        for src in sources.iter().flatten() {
+            if let Some((name, is_func)) = math::scan_definition(src) {
                 if is_func {
                     user_funcs.insert(name.clone());
                 }
@@ -366,12 +411,22 @@ impl GraphApp {
         }
 
         // 2) Parseo de cada línea.
-        let parsed: Vec<Option<Result<(Statement, Vec<Restriction>), MathError>>> = self
-            .items
+        let parsed: Vec<Option<Result<(Statement, Vec<Restriction>), MathError>>> = sources
             .iter()
-            .map(|it| {
-                let t = it.text.trim();
-                (!t.is_empty()).then(|| math::parse_statement(t, &user_funcs, &user_names))
+            .map(|src| match src {
+                Ok(t) => {
+                    let t = t.trim();
+                    (!t.is_empty()).then(|| math::parse_statement(t, &user_funcs, &user_names))
+                }
+                Err(e) => Some(Err(e.clone())),
+            })
+            .collect();
+
+        self.pretty = parsed
+            .iter()
+            .map(|p| match p {
+                Some(Ok((st, rs))) => Some(pretty::statement(st, rs)),
+                _ => None,
             })
             .collect();
 
@@ -476,15 +531,20 @@ impl GraphApp {
         for (i, p) in parsed.into_iter().enumerate() {
             let kind = match p {
                 None => Kind::Empty,
-                Some(Err(e)) => Kind::Error(e.0),
-                Some(Ok(_)) if dup.contains(&i) => Kind::Error("nombre ya definido en otra línea".into()),
+                Some(Err(e)) => Kind::Error { msg: e.0, missing: Vec::new() },
+                Some(Ok(_)) if dup.contains(&i) => Kind::Error { msg: "nombre ya definido en otra línea".into(), missing: Vec::new() },
                 Some(Ok((st, rs))) => {
                     let it = &self.items[i];
                     let (t0, t1) = it.domain.unwrap_or(DEFAULT_DOMAIN);
                     // Durante la animación de dibujo, la curva llega solo hasta el progreso actual.
                     let domain = if it.draw.active { (t0, t0 + (t1 - t0) * it.draw.progress.max(1e-9)) } else { (t0, t1) };
                     let ctx = Ctx { env: &env, lists: &lists, sliders: &sliders, domain };
-                    classify(st, &rs, &ctx, const_results.remove(&i), list_results.remove(&i)).unwrap_or_else(|e| Kind::Error(e.0))
+                    let free = points::statement_free_vars(&st, &rs);
+                    classify(st, &rs, &ctx, const_results.remove(&i), list_results.remove(&i)).unwrap_or_else(|e| {
+                        let mut missing: Vec<String> = free.into_iter().filter(|n| is_missing(n, &env, &lists)).collect();
+                        missing.sort();
+                        Kind::Error { msg: e.0, missing }
+                    })
                 }
             };
             kinds.push(kind);
@@ -598,6 +658,128 @@ impl GraphApp {
         }
     }
 
+    /// Atajos de teclado: F1 guía, Ctrl+K teclado, Ctrl+Z deshacer borrado (fuera de un campo).
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let editing = ctx.memory(|m| m.focused().is_some());
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, Key::F1) {
+                self.help_open = !self.help_open;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, Key::K) {
+                self.keyboard_open = !self.keyboard_open;
+            }
+            if !editing && i.consume_key(egui::Modifiers::COMMAND, Key::Z) {
+                self.undo_delete();
+            }
+        });
+    }
+
+    /// Borra una línea guardándola para poder deshacer.
+    fn delete_item(&mut self, idx: usize) {
+        let removed = self.items.remove(idx);
+        if self.selected == Some(removed.id) {
+            self.selected = None;
+        }
+        self.deleted.push((idx, removed));
+        if self.deleted.len() > 30 {
+            self.deleted.remove(0);
+        }
+        if self.items.is_empty() {
+            let id = self.push_item("");
+            self.focus_next = Some(id);
+        }
+        self.revision += 1;
+    }
+
+    /// Recupera la última línea borrada.
+    fn undo_delete(&mut self) {
+        let Some((idx, item)) = self.deleted.pop() else { return };
+        // Si solo queda una línea vacía (creada al borrar todo), se reemplaza.
+        if self.items.len() == 1 && self.items[0].text.trim().is_empty() {
+            self.items.clear();
+        }
+        let idx = idx.min(self.items.len());
+        self.items.insert(idx, item);
+        self.revision += 1;
+    }
+
+    /// Nombre parecido a `base` que no esté usado (f → f_2, a → a_2…).
+    fn free_name(&self, base: &str) -> String {
+        let used: HashSet<String> = self.items.iter().filter_map(|it| math::scan_definition(&it.text).map(|(n, _)| n)).collect();
+        (2..).map(|k| format!("{base}_{k}")).find(|n| !used.contains(n)).unwrap()
+    }
+
+    /// Aplica una tecla del teclado en pantalla a la expresión que tenía el cursor
+    /// (o a una nueva, si no había ninguna).
+    fn apply_key(&mut self, ctx: &egui::Context, action: keyboard::Action) {
+        let idx = match self.last_edit.and_then(|id| self.items.iter().position(|it| it.id == id)) {
+            Some(i) => i,
+            None => {
+                if !self.items.last().is_some_and(|it| it.text.trim().is_empty()) {
+                    self.push_item("");
+                }
+                self.items.len() - 1
+            }
+        };
+        let id = self.items[idx].id;
+        let edit_id = expr_edit_id(id);
+        let mut chars: Vec<char> = self.items[idx].text.chars().collect();
+        let mut state = egui::text_edit::TextEditState::load(ctx, edit_id).unwrap_or_default();
+        // Cursor y selección actuales (por defecto, al final del texto).
+        let (mut lo, mut hi) = state
+            .cursor
+            .char_range()
+            .map(|r| {
+                let (a, b) = (r.primary.index.0, r.secondary.index.0);
+                (a.min(b), a.max(b))
+            })
+            .unwrap_or((chars.len(), chars.len()));
+        lo = lo.min(chars.len());
+        hi = hi.min(chars.len());
+
+        let cursor = match action {
+            keyboard::Action::Insert { text, back } => {
+                let ins: Vec<char> = text.chars().collect();
+                chars.splice(lo..hi, ins.iter().copied());
+                lo + ins.len() - back.min(ins.len())
+            }
+            keyboard::Action::Backspace => {
+                if hi > lo {
+                    chars.drain(lo..hi);
+                    lo
+                } else if lo > 0 {
+                    chars.remove(lo - 1);
+                    lo - 1
+                } else {
+                    0
+                }
+            }
+            keyboard::Action::Left => lo.saturating_sub(if hi > lo { 0 } else { 1 }),
+            keyboard::Action::Right => (hi + if hi > lo { 0 } else { 1 }).min(chars.len()),
+            keyboard::Action::Enter => {
+                let item = self.new_item("");
+                let new_id = item.id;
+                self.items.insert(idx + 1, item);
+                self.focus_next = Some(new_id);
+                self.last_edit = Some(new_id);
+                self.revision += 1;
+                return;
+            }
+        };
+        let text: String = chars.into_iter().collect();
+        if text != self.items[idx].text {
+            self.items[idx].text = text;
+            self.revision += 1;
+        }
+        let c = egui::text::CCursor::new(cursor);
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
+        state.store(ctx, edit_id);
+        // Devolver el foco al campo para seguir escribiendo.
+        ctx.memory_mut(|m| m.request_focus(edit_id));
+        self.last_edit = Some(id);
+        self.selected = Some(id);
+    }
+
     // ───────────────────────── Panel de expresiones ─────────────────────────
 
     fn expressions_panel(&mut self, ui: &mut egui::Ui) {
@@ -605,8 +787,14 @@ impl GraphApp {
         ui.horizontal(|ui| {
             ui.heading("Expresiones");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(RichText::new("❓").size(16.0)).on_hover_text("Guía de uso").clicked() {
+                if ui.button(RichText::new("❓").size(16.0)).on_hover_text("Guía de uso (F1)").clicked() {
                     self.help_open = true;
+                }
+                if ui.add(egui::Button::new(RichText::new("⌨").size(16.0)).selected(self.keyboard_open)).on_hover_text("Teclado (Ctrl+K)").clicked() {
+                    self.keyboard_open = !self.keyboard_open;
+                }
+                if !self.deleted.is_empty() && ui.button(RichText::new("↶").size(16.0)).on_hover_text("Deshacer el borrado (Ctrl+Z)").clicked() {
+                    self.undo_delete();
                 }
                 let resp = ui.button(RichText::new("⚙").size(16.0)).on_hover_text("Ajustes");
                 egui::Popup::menu(&resp)
@@ -622,6 +810,8 @@ impl GraphApp {
 
         let mut remove = None;
         let mut add_after = None;
+        let mut add_sliders: Option<(usize, Vec<String>)> = None;
+        let mut row_action: Option<(usize, RowAction)> = None;
         let mut changed = false;
         let font = self.settings.expr_font();
         let row_h = self.settings.expr_size + 10.0;
@@ -657,8 +847,22 @@ impl GraphApp {
                             ui.visuals().weak_text_color(),
                         );
                     }
+                    // Clic derecho: acciones de la línea.
+                    resp.context_menu(|ui| {
+                        for (label, action) in [
+                            ("⧉  Duplicar", RowAction::Duplicate),
+                            ("⏶  Subir", RowAction::Up),
+                            ("⏷  Bajar", RowAction::Down),
+                            ("✕  Eliminar", RowAction::Delete),
+                        ] {
+                            if ui.button(label).clicked() {
+                                row_action = Some((idx, action));
+                                ui.close();
+                            }
+                        }
+                    });
                     if kind.is_graph() {
-                        let resp = resp.on_hover_text("Estilo y visibilidad");
+                        let resp = resp.on_hover_text("Estilo y visibilidad (clic derecho: más opciones)");
                         let target = EditorTarget {
                             has_line: kind.curve().is_some(),
                             has_fill: matches!(kind, Kind::Ineq { .. }),
@@ -684,8 +888,20 @@ impl GraphApp {
                         if ui.button(RichText::new("✕").size(self.settings.expr_size * 0.7)).on_hover_text("Eliminar").clicked() {
                             remove = Some(idx);
                         }
+                        // Escritura matemática salvo mientras se edita (clic para editar).
+                        let edit_id = expr_edit_id(item.id);
+                        let editing = ui.memory(|m| m.has_focus(edit_id)) || self.focus_next == Some(item.id);
+                        let node = self.pretty.get(idx).and_then(Option::as_ref);
+                        if let (true, false, Some(node)) = (self.settings.pretty_math && !item.text.trim().is_empty(), editing, node) {
+                            if math_view(ui, node, self.settings.expr_size).clicked() {
+                                self.focus_next = Some(item.id);
+                                self.selected = Some(item.id);
+                            }
+                            return;
+                        }
                         let resp = ui.add(
                             TextEdit::singleline(&mut item.text)
+                                .id(edit_id)
                                 .desired_width(ui.available_width())
                                 .font(font.clone())
                                 .margin(vec2(6.0, 4.0))
@@ -697,6 +913,9 @@ impl GraphApp {
                         }
                         if resp.gained_focus() {
                             self.selected = Some(item.id);
+                        }
+                        if resp.has_focus() {
+                            self.last_edit = Some(item.id);
                         }
                         if resp.changed() {
                             changed = true;
@@ -719,9 +938,22 @@ impl GraphApp {
                 // Información bajo la expresión.
                 let small = self.settings.expr_size * 0.75;
                 match kind {
-                    Kind::Error(msg) => {
+                    Kind::Error { msg, missing } => {
                         ui.indent(item.id, |ui| {
                             ui.label(RichText::new(format!("⚠ {msg}")).color(ui.visuals().error_fg_color).size(small));
+                            if !missing.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("Crear deslizador:").size(small).weak());
+                                    for name in missing.iter().take(6) {
+                                        if ui.button(RichText::new(format!("＋ {name}")).size(small)).on_hover_text(format!("Añade {name} = 1")).clicked() {
+                                            add_sliders = Some((idx, vec![name.clone()]));
+                                        }
+                                    }
+                                    if missing.len() > 1 && ui.button(RichText::new("＋ todos").size(small)).clicked() {
+                                        add_sliders = Some((idx, missing.clone()));
+                                    }
+                                });
+                            }
                         });
                     }
                     Kind::Value(v) => {
@@ -768,21 +1000,47 @@ impl GraphApp {
 
         });
 
+        if let Some((idx, names)) = add_sliders {
+            for (k, name) in names.iter().enumerate() {
+                let item = self.new_item(&format!("{name} = 1"));
+                self.items.insert(idx + 1 + k, item);
+            }
+            changed = true;
+        }
         if let Some(idx) = add_after {
             let item = self.new_item("");
             self.focus_next = Some(item.id);
             self.items.insert(idx + 1, item);
             changed = true;
         }
+        match row_action {
+            Some((idx, RowAction::Delete)) => remove = Some(idx),
+            Some((idx, RowAction::Duplicate)) => {
+                let mut copy = self.new_item(&self.items[idx].text.clone());
+                copy.style = self.items[idx].style;
+                copy.slider = self.items[idx].slider;
+                copy.domain = self.items[idx].domain;
+                copy.label = self.items[idx].label.clone();
+                // Una definición duplicada chocaría con la original: se renombra.
+                if let Some((name, _)) = math::scan_definition(&copy.text) {
+                    let new_name = self.free_name(&name);
+                    copy.text = copy.text.replacen(&name, &new_name, 1);
+                }
+                self.items.insert(idx + 1, copy);
+                changed = true;
+            }
+            Some((idx, RowAction::Up)) if idx > 0 => {
+                self.items.swap(idx, idx - 1);
+                changed = true;
+            }
+            Some((idx, RowAction::Down)) if idx + 1 < self.items.len() => {
+                self.items.swap(idx, idx + 1);
+                changed = true;
+            }
+            _ => {}
+        }
         if let Some(idx) = remove {
-            let removed = self.items.remove(idx);
-            if self.selected == Some(removed.id) {
-                self.selected = None;
-            }
-            if self.items.is_empty() {
-                let id = self.push_item("");
-                self.focus_next = Some(id);
-            }
+            self.delete_item(idx);
             changed = true;
         }
         if changed {
@@ -805,6 +1063,7 @@ impl GraphApp {
         ui.checkbox(&mut self.settings.monospace, "Fuente monoespaciada");
         ui.add(egui::Slider::new(&mut self.settings.label_size, 9.0..=24.0).step_by(1.0).text("Números de los ejes"));
         ui.checkbox(&mut self.settings.show_pois, "Puntos notables al seleccionar una curva");
+        ui.checkbox(&mut self.settings.pretty_math, "Escritura matemática (exponentes, fracciones…)");
         ui.add_space(4.0);
         if ui.button("Restablecer ajustes").clicked() {
             self.settings = Settings::default();
@@ -1453,6 +1712,50 @@ fn point_extras_ui(ui: &mut egui::Ui, item: &mut Item, name: Option<&str>, singl
     changed
 }
 
+/// Expresión con escritura matemática, en un recuadro como el del campo de texto.
+/// Si no cabe a lo ancho, se reduce (hasta el 60 %).
+fn math_view(ui: &mut egui::Ui, node: &pretty::Node, size: f32) -> egui::Response {
+    let color = ui.visuals().strong_text_color();
+    let painter = ui.painter().clone();
+    let composer = pretty::Composer { painter: &painter, color };
+    let pad = vec2(6.0, 5.0);
+    let avail = ui.available_width();
+    let mut layout = composer.layout(node, size);
+    if layout.w > avail - 2.0 * pad.x {
+        let scale = ((avail - 2.0 * pad.x) / layout.w).max(0.6);
+        layout = composer.layout(node, size * scale);
+    }
+    let h = (layout.height() + 2.0 * pad.y).max(size * 1.3 + 8.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(avail, h), Sense::click());
+    let visuals = ui.visuals();
+    ui.painter().rect_filled(rect, 4.0, visuals.text_edit_bg_color());
+    if resp.hovered() {
+        ui.painter().rect_stroke(rect, 4.0, visuals.widgets.hovered.bg_stroke, egui::StrokeKind::Inside);
+    }
+    let baseline = rect.center().y + (layout.asc - layout.desc) / 2.0;
+    layout.paint(&ui.painter_at(rect.shrink(1.0)), pos2(rect.left() + pad.x, baseline), color);
+    resp.on_hover_cursor(egui::CursorIcon::Text)
+}
+
+/// ¿`name` es una variable sin definir (candidata a deslizador)?
+fn is_missing(name: &str, env: &Env, lists: &Lists) -> bool {
+    const KNOWN: &[&str] = &["x", "y", "θ", "theta", "r", "i", "e", "pi", "π", "tau", "τ", "inf"];
+    name.chars().next().is_some_and(char::is_alphabetic)
+        && !name.contains('.')
+        && !KNOWN.contains(&name)
+        && !env.constants.contains_key(name)
+        && !env.complex.contains_key(name)
+        && !env.funcs.contains_key(name)
+        && !env.points.contains(name)
+        && !lists.numbers.contains_key(name)
+        && !lists.points.contains_key(name)
+}
+
+/// Id del campo de texto de una expresión (para que el teclado sepa dónde escribir).
+fn expr_edit_id(item_id: u64) -> egui::Id {
+    egui::Id::unique(("expresion", item_id))
+}
+
 fn draw_tooltip(painter: &egui::Painter, rect: Rect, p: Pos2, text: String, accent: Color32, dark: bool) {
     let text_color = if dark { Color32::from_gray(230) } else { Color32::from_gray(20) };
     let galley = painter.layout_no_wrap(text, FontId::proportional(14.0), text_color);
@@ -1865,9 +2168,21 @@ pub fn format_number(v: f64) -> String {
 impl eframe::App for GraphApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(&ui.ctx().clone());
+        self.shortcuts(ui.ctx());
         self.analyze();
         self.animate(&ui.ctx().clone());
         self.analyze();
+
+        // Teclado abajo, a todo el ancho.
+        if self.keyboard_open {
+            let mut action = None;
+            egui::Panel::bottom("teclado").resizable(false).exact_size(262.0).show(ui, |ui| {
+                action = keyboard::keyboard_ui(ui, &mut self.keyboard, &mut self.keyboard_open);
+            });
+            if let Some(a) = action {
+                self.apply_key(ui.ctx(), a);
+            }
+        }
 
         egui::Panel::left("expresiones")
             .resizable(true)
@@ -1894,6 +2209,107 @@ impl eframe::App for GraphApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if !self.persist {
+            return;
+        }
         eframe::set_value(storage, eframe::APP_KEY, self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_inserts_at_cursor() {
+        let ctx = egui::Context::default();
+        let mut app = GraphApp::default();
+        app.items.clear();
+        let id = app.push_item("y = 2");
+        app.last_edit = Some(id);
+        let ins = |text: &str, back: usize| keyboard::Action::Insert { text: text.into(), back };
+
+        // Sin cursor guardado se escribe al final; la función deja el cursor dentro.
+        app.apply_key(&ctx, ins("sin()", 1));
+        assert_eq!(app.items[0].text, "y = 2sin()");
+        app.apply_key(&ctx, ins("x", 0));
+        assert_eq!(app.items[0].text, "y = 2sin(x)");
+        // Plantillas con varios huecos: el cursor queda en el primero.
+        app.apply_key(&ctx, keyboard::Action::Right);
+        app.apply_key(&ctx, ins(" + ", 0));
+        app.apply_key(&ctx, ins("nCr(, )", 3));
+        app.apply_key(&ctx, ins("5", 0));
+        assert_eq!(app.items[0].text, "y = 2sin(x) + nCr(5, )");
+        app.apply_key(&ctx, keyboard::Action::Backspace);
+        assert_eq!(app.items[0].text, "y = 2sin(x) + nCr(, )");
+        app.apply_key(&ctx, keyboard::Action::Left);
+        app.apply_key(&ctx, keyboard::Action::Backspace);
+        assert_eq!(app.items[0].text, "y = 2sin(x) + nC(, )");
+        // ↵ crea una línea nueva y pasa a escribir en ella.
+        app.apply_key(&ctx, keyboard::Action::Enter);
+        app.apply_key(&ctx, ins("α", 0));
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(app.items[1].text, "α");
+    }
+
+    fn app_with(lines: &[&str]) -> GraphApp {
+        let mut app = GraphApp::default();
+        app.items.clear();
+        for l in lines {
+            app.push_item(l);
+        }
+        app.analyze();
+        app
+    }
+
+    #[test]
+    fn qol_behaviour() {
+        // Variables sin definir: se ofrecen como deslizadores.
+        let app = app_with(&["y = a x + b c"]);
+        let Kind::Error { missing, .. } = &app.kinds[0] else { panic!("debería ser un error") };
+        assert_eq!(missing, &vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // Los parámetros de funciones y las variables ligadas no cuentan.
+        let app = app_with(&["f(u) = u k", "sum(n, n m, 1, 3)"]);
+        let Kind::Error { missing, .. } = &app.kinds[0] else { panic!() };
+        assert_eq!(missing, &vec!["k".to_string()]);
+        let Kind::Error { missing, .. } = &app.kinds[1] else { panic!() };
+        assert_eq!(missing, &vec!["m".to_string()]);
+
+        // t puede ser un deslizador; sin definirlo sigue siendo el parámetro.
+        let app = app_with(&["t = 2", "y = t x", "(cos(t), sin(t))"]);
+        assert!(matches!(app.kinds[0], Kind::Slider { .. }));
+        assert!(matches!(app.kinds[1], Kind::Curve(Curve::Fx(_))));
+        assert!(matches!(app.kinds[2], Kind::Points { .. })); // con t definido, es un punto
+        let app = app_with(&["(cos(t), sin(t))"]);
+        assert!(matches!(app.kinds[0], Kind::Curve(Curve::Param { .. })));
+
+        // Paréntesis de agrupación sin cerrar.
+        let app = app_with(&["y = (x + 2", "y = sin(x"]);
+        assert!(matches!(app.kinds[0], Kind::Curve(_)));
+        assert!(matches!(app.kinds[1], Kind::Error { .. }));
+
+        // Primitiva de una función con nombre.
+        let app = app_with(&["f(x) = 2x", "y = int(x, f)"]);
+        let Kind::Curve(Curve::Fx(c)) = &app.kinds[1] else { panic!() };
+        assert!((c.eval(3.0, 0.0) - 9.0).abs() < 1e-9);
+
+        // Duplicar renombra las definiciones; borrar se puede deshacer.
+        let mut app = app_with(&["a = 1", "y = a x"]);
+        assert_eq!(app.free_name("a"), "a_2");
+        app.delete_item(1);
+        assert_eq!(app.items.len(), 1);
+        app.undo_delete();
+        assert_eq!(app.items[1].text, "y = a x");
+    }
+
+    #[test]
+    fn latex_lines() {
+        let app = app_with(&[r"f(x) = \frac{x^2}{2}", r"y = f(x) + \sqrt{x}", r"\sum_{n=1}^{4} n", r"\frac{1}{2"]);
+        assert!(matches!(app.kinds[0], Kind::Curve(Curve::Fx(_))));
+        let Kind::Curve(Curve::Fx(c)) = &app.kinds[1] else { panic!("{:?}", app.items[1].text) };
+        assert!((c.eval(4.0, 0.0) - 10.0).abs() < 1e-12);
+        assert!(matches!(app.kinds[2], Kind::Value(v) if v == 10.0));
+        assert!(matches!(app.kinds[3], Kind::Error { .. }));
+        assert!(app.pretty[0].is_some());
     }
 }

@@ -193,6 +193,7 @@ name = "app_grafica"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "libm",
  "num-complex",
  "serde",
  "windows-sys 0.61.2",
