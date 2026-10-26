@@ -22,13 +22,29 @@ Type=Application
 Name=AppGrafica
 GenericName=Calculadora gráfica
 Comment=Calculadora gráfica: funciones, ecuaciones, desigualdades y más
-Exec=$bin/appgrafica
+Exec=$bin/appgrafica %f
+MimeType=application/x-appgrafica;
 Icon=appgrafica
 Terminal=false
 Categories=Education;Math;Science;
 Keywords=graficar;calculadora;matemáticas;funciones;gráfica;
 StartupWMClass=appgrafica
 DESKTOP
+
+# Tipo de archivo de los proyectos (.agraf): se abren con doble clic.
+mime="$HOME/.local/share/mime"
+mkdir -p "$mime/packages"
+cat > "$mime/packages/appgrafica.xml" <<MIME
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-appgrafica">
+    <comment>Proyecto de AppGrafica</comment>
+    <glob pattern="*.agraf"/>
+    <icon name="appgrafica"/>
+  </mime-type>
+</mime-info>
+MIME
+command -v update-mime-database >/dev/null && update-mime-database "$mime" || true
 
 command -v update-desktop-database >/dev/null && update-desktop-database "$apps" || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true

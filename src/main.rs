@@ -10,6 +10,7 @@ mod math;
 mod plot;
 mod points;
 mod pretty;
+mod project;
 mod special;
 mod style;
 

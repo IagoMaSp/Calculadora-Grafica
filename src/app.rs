@@ -1,6 +1,8 @@
 //! Interfaz: panel de expresiones a la izquierda y lienzo de la gráfica a la derecha.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, TextEdit, TextureHandle,
@@ -15,6 +17,7 @@ use crate::math::{self, C64, CondPoint, Compiled, Env, Expr, MathError, Restrict
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::points::{self, Coord, ListValue, Lists};
 use crate::pretty;
+use crate::project;
 use crate::style::{self, EditorTarget, LineStyle, Style};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -46,7 +49,31 @@ struct Item {
     /// ¿Se muestran los ajustes del deslizador (rango, paso, velocidad)?
     #[serde(skip)]
     slider_open: bool,
+    /// Si existe, la línea es un texto sobre la gráfica (y `text` es su contenido).
+    #[serde(default)]
+    note: Option<Note>,
 }
+
+/// Texto colocado sobre la gráfica.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
+#[serde(default)]
+struct Note {
+    /// Esquina superior izquierda, en coordenadas de la gráfica (se mueve con ella).
+    x: f64,
+    y: f64,
+    size: f32,
+    /// Recuadro semitransparente detrás del texto.
+    background: bool,
+}
+
+impl Default for Note {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, size: 18.0, background: true }
+    }
+}
+
+/// Color por defecto de los textos (negro; con tema oscuro se ve claro).
+const NOTE_COLOR: [u8; 3] = [0x00, 0x00, 0x00];
 
 /// Acciones del menú contextual de una línea.
 #[derive(Clone, Copy)]
@@ -177,6 +204,8 @@ enum Kind {
     Points { pts: Vec<(f64, f64)>, name: Option<String>, drag: Option<[Coord; 2]>, list: bool, value: Option<C64> },
     /// Lista de números: `[1, 2, 3]`.
     Numbers(Vec<f64>),
+    /// Texto sobre la gráfica, con los `{…}` ya sustituidos por su valor.
+    Note(String),
 }
 
 impl Kind {
@@ -268,9 +297,9 @@ pub struct GraphApp {
     focus_next: Option<u64>,
     #[serde(skip)]
     theme_applied: Option<ThemeChoice>,
-    /// Punto que se está arrastrando.
+    /// Punto o texto que se está arrastrando.
     #[serde(skip)]
-    dragging: Option<u64>,
+    dragging: Option<Drag>,
     /// Teclado en pantalla.
     keyboard_open: bool,
     keyboard: KeyboardState,
@@ -288,6 +317,85 @@ pub struct GraphApp {
     help_open: bool,
     #[serde(skip)]
     help_section: usize,
+    /// Archivo del proyecto abierto (None = todavía sin guardar).
+    project_path: Option<PathBuf>,
+    /// Contenido del proyecto la última vez que se guardó o abrió (para saber si hay cambios).
+    saved: String,
+    /// Proyectos abiertos o guardados hace poco.
+    recent: Vec<PathBuf>,
+    /// Acción a la espera de responder "¿Guardar los cambios?".
+    #[serde(skip)]
+    pending: Option<FileAction>,
+    /// Captura de la gráfica en curso (exportar imagen).
+    #[serde(skip)]
+    capture: Option<Capture>,
+    /// Aviso temporal sobre la gráfica: (texto, es un error, hasta qué instante).
+    #[serde(skip)]
+    toast: Option<(String, bool, f64)>,
+    /// Título de la ventana ya aplicado.
+    #[serde(skip)]
+    title_shown: String,
+    /// Herramienta de texto activa: el próximo clic en la gráfica crea un texto.
+    #[serde(skip)]
+    placing_note: bool,
+    /// Texto que se está editando directamente sobre la gráfica.
+    #[serde(skip)]
+    editing_note: Option<u64>,
+    /// Dónde se abrió el menú contextual de la gráfica.
+    #[serde(skip)]
+    context_pos: Option<Pos2>,
+    /// Zona de la gráfica en el último fotograma (para recortar la captura).
+    #[serde(skip)]
+    canvas_rect: Rect,
+}
+
+/// Qué se está arrastrando en la gráfica.
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    Point(u64),
+    Note(u64),
+}
+
+/// Acciones que reemplazan el proyecto actual (y piden guardar antes si hay cambios).
+#[derive(Clone)]
+enum FileAction {
+    New,
+    /// None = elegir el archivo con un diálogo.
+    Open(Option<PathBuf>),
+}
+
+enum CaptureTarget {
+    File(PathBuf),
+    Clipboard,
+}
+
+struct Capture {
+    target: CaptureTarget,
+    /// Aquí deja la imagen el aviso de captura terminada.
+    slot: Arc<Mutex<Option<Arc<egui::ColorImage>>>>,
+}
+
+/// Proyecto tal como se escribe en el archivo.
+#[derive(serde::Serialize)]
+struct ProjectOut<'a> {
+    app: &'static str,
+    version: u32,
+    view: View,
+    items: &'a [Item],
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectIn {
+    #[serde(default)]
+    view: View,
+    items: Vec<Item>,
+}
+
+/// Recuadro de un texto en pantalla.
+struct NoteBox {
+    id: u64,
+    rect: Rect,
+    galley: Arc<egui::Galley>,
 }
 
 impl Default for GraphApp {
@@ -314,10 +422,22 @@ impl Default for GraphApp {
             persist: true,
             help_open: false,
             help_section: 0,
+            project_path: None,
+            saved: String::new(),
+            recent: Vec::new(),
+            pending: None,
+            capture: None,
+            toast: None,
+            title_shown: String::new(),
+            placing_note: false,
+            editing_note: None,
+            context_pos: None,
+            canvas_rect: Rect::NOTHING,
         };
         for text in ["y = sin(x)", "a = 0.5", "y = a x^2 - 3", "x^2 + y^2 < 9", "A = (2, 1)"] {
             app.push_item(text);
         }
+        app.saved = app.snapshot();
         app
     }
 }
@@ -339,7 +459,11 @@ impl GraphApp {
             .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
             .unwrap_or_default();
         app.revision = 1;
-        if !initial.is_empty() {
+        // Un proyecto como argumento (p. ej. al abrir un .agraf desde el explorador de archivos)
+        // se abre como desde el menú; si no, los argumentos son expresiones.
+        if let Some(path) = initial.first().map(PathBuf::from).filter(|p| project::is_project(p)) {
+            app.request(None, FileAction::Open(Some(path)));
+        } else if !initial.is_empty() {
             app.persist = false;
             app.items.clear();
             app.next_id = 0;
@@ -372,6 +496,7 @@ impl GraphApp {
             trail: Vec::new(),
             draw: DrawAnim::default(),
             slider_open: false,
+            note: None,
         }
     }
 
@@ -381,6 +506,255 @@ impl GraphApp {
         self.items.push(item);
         self.revision += 1;
         id
+    }
+
+    /// Añade un texto en (x, y) de la gráfica y lo deja editándose sobre ella.
+    fn add_note(&mut self, x: f64, y: f64) -> u64 {
+        let mut item = self.new_item("");
+        item.note = Some(Note { x, y, ..Default::default() });
+        item.style.color = NOTE_COLOR;
+        let id = item.id;
+        // Sustituye la línea vacía del final, si la hay.
+        if self.items.last().is_some_and(|it| it.note.is_none() && it.text.trim().is_empty()) {
+            self.items.pop();
+        }
+        self.items.push(item);
+        self.revision += 1;
+        self.selected = Some(id);
+        self.editing_note = Some(id);
+        id
+    }
+
+    // ───────────────────────── Proyectos ─────────────────────────
+
+    /// Contenido del proyecto que cuenta como "cambio" (la vista no: moverse no es editar).
+    fn snapshot(&self) -> String {
+        serde_json::to_string(&self.items).unwrap_or_default()
+    }
+
+    fn is_dirty(&self) -> bool {
+        // Un proyecto nuevo y vacío no tiene nada que guardar.
+        let empty = self.items.iter().all(|it| it.text.trim().is_empty());
+        !(empty && self.project_path.is_none()) && self.snapshot() != self.saved
+    }
+
+    fn project_name(&self) -> String {
+        self.project_path.as_deref().map(project::stem).unwrap_or_else(|| "Sin título".into())
+    }
+
+    /// Carpeta donde abrir los diálogos: la del proyecto actual o la del último reciente.
+    fn dialog_dir(&self) -> Option<PathBuf> {
+        self.project_path.as_ref().or(self.recent.first()).and_then(|p| p.parent()).map(|p| p.to_path_buf())
+    }
+
+    fn notify(&mut self, ctx: &egui::Context, text: impl Into<String>, error: bool) {
+        let until = ctx.input(|i| i.time) + if error { 6.0 } else { 3.0 };
+        self.toast = Some((text.into(), error, until));
+    }
+
+    /// Ejecuta `action`, o pregunta antes si hay cambios sin guardar.
+    fn request(&mut self, ctx: Option<&egui::Context>, action: FileAction) {
+        if self.is_dirty() {
+            self.pending = Some(action);
+        } else {
+            self.pending = None;
+            self.run_action(ctx, action);
+        }
+    }
+
+    fn run_action(&mut self, ctx: Option<&egui::Context>, action: FileAction) {
+        match action {
+            FileAction::New => self.new_project(),
+            FileAction::Open(path) => {
+                let Some(path) = path.or_else(|| project::pick_open(self.dialog_dir().as_deref())) else { return };
+                if let Err(e) = self.load_from(&path) {
+                    let msg = format!("No se pudo abrir {}: {e}", path.display());
+                    match ctx {
+                        Some(ctx) => self.notify(ctx, msg, true),
+                        // Al arrancar todavía no hay contexto: el aviso se muestra en el primer fotograma.
+                        None => self.toast = Some((msg, true, f64::INFINITY)),
+                    }
+                    self.recent.retain(|r| r != &path);
+                }
+            }
+        }
+    }
+
+    fn clear_transient(&mut self) {
+        self.selected = None;
+        self.dragging = None;
+        self.editing_note = None;
+        self.focus_next = None;
+        self.last_edit = None;
+        self.deleted.clear();
+        self.kinds.clear();
+        self.pretty.clear();
+        self.analyzed_revision = None;
+        self.geometry = None;
+        self.pois = None;
+        self.revision += 1;
+    }
+
+    fn new_project(&mut self) {
+        self.items.clear();
+        self.next_id = 0;
+        self.view = View::default();
+        self.project_path = None;
+        self.clear_transient();
+        let id = self.push_item("");
+        self.focus_next = Some(id);
+        self.saved = self.snapshot();
+    }
+
+    fn load_from(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let p: ProjectIn = serde_json::from_str(&data).map_err(|_| "el archivo no es un proyecto válido".to_string())?;
+        self.items = p.items;
+        if self.items.is_empty() {
+            let item = self.new_item("");
+            self.items.push(item);
+        }
+        self.next_id = self.items.iter().map(|it| it.id + 1).max().unwrap_or(0);
+        // Ids repetidos (archivo editado a mano): se renumeran.
+        let mut seen = HashSet::new();
+        for i in 0..self.items.len() {
+            if !seen.insert(self.items[i].id) {
+                self.items[i].id = self.next_id;
+                self.next_id += 1;
+            }
+        }
+        self.view = p.view;
+        self.persist = true;
+        self.project_path = Some(path.to_path_buf());
+        self.clear_transient();
+        self.saved = self.snapshot();
+        project::push_recent(&mut self.recent, path);
+        Ok(())
+    }
+
+    fn save_to(&mut self, ctx: &egui::Context, path: PathBuf) -> bool {
+        let out = ProjectOut { app: "AppGrafica", version: 1, view: self.view, items: &self.items };
+        let res = serde_json::to_string_pretty(&out).map_err(|e| e.to_string()).and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()));
+        match res {
+            Ok(()) => {
+                self.saved = self.snapshot();
+                project::push_recent(&mut self.recent, &path);
+                self.project_path = Some(path);
+                self.persist = true;
+                self.notify(ctx, format!("Proyecto guardado: {}", self.project_name()), false);
+                true
+            }
+            Err(e) => {
+                self.notify(ctx, format!("No se pudo guardar: {e}"), true);
+                false
+            }
+        }
+    }
+
+    /// Guardar (pide el nombre si el proyecto aún no tiene archivo). Devuelve si se guardó.
+    fn save_project(&mut self, ctx: &egui::Context) -> bool {
+        match self.project_path.clone() {
+            Some(p) => self.save_to(ctx, p),
+            None => self.save_project_as(ctx),
+        }
+    }
+
+    fn save_project_as(&mut self, ctx: &egui::Context) -> bool {
+        match project::pick_save(self.dialog_dir().as_deref(), &self.project_name()) {
+            Some(p) => self.save_to(ctx, p),
+            None => false,
+        }
+    }
+
+    /// Exporta la gráfica (sin botones ni marcas de selección) a un PNG o al portapapeles.
+    fn export_image(&mut self, ctx: &egui::Context, to_clipboard: bool) {
+        let target = if to_clipboard {
+            CaptureTarget::Clipboard
+        } else {
+            match project::pick_png(self.dialog_dir().as_deref(), &self.project_name()) {
+                Some(p) => CaptureTarget::File(p),
+                None => return,
+            }
+        };
+        let slot = Arc::new(Mutex::new(None));
+        let (slot2, ctx2) = (slot.clone(), ctx.clone());
+        // La captura es del fotograma siguiente, que se dibuja ya sin los controles.
+        ctx.request_screenshot(move |img| {
+            if let Ok(mut s) = slot2.lock() {
+                *s = Some(img);
+            }
+            ctx2.request_repaint();
+        });
+        self.capture = Some(Capture { target, slot });
+    }
+
+    /// Recoge la captura cuando llega y la guarda.
+    fn finish_capture(&mut self, ctx: &egui::Context) {
+        let Some(cap) = &self.capture else { return };
+        let Some(img) = cap.slot.lock().ok().and_then(|mut s| s.take()) else { return };
+        let Some(cap) = self.capture.take() else { return };
+        let ppp = ctx.pixels_per_point();
+        let full = Rect::from_min_size(Pos2::ZERO, vec2(img.size[0] as f32, img.size[1] as f32) / ppp);
+        let r = self.canvas_rect.intersect(full);
+        if !r.is_positive() {
+            self.notify(ctx, "No se pudo capturar la gráfica", true);
+            return;
+        }
+        let img = img.region(&r, Some(ppp));
+        match cap.target {
+            CaptureTarget::Clipboard => {
+                ctx.copy_image(img);
+                self.notify(ctx, "Imagen copiada al portapapeles", false);
+            }
+            CaptureTarget::File(path) => match project::write_png(&path, &img) {
+                Ok(()) => self.notify(ctx, format!("Imagen guardada: {}", path.display()), false),
+                Err(e) => self.notify(ctx, format!("No se pudo guardar la imagen: {e}"), true),
+            },
+        }
+    }
+
+    /// Título de la ventana: nombre del proyecto y ● si hay cambios sin guardar.
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let dirty = if self.is_dirty() { "● " } else { "" };
+        let title = format!("{dirty}{} — AppGrafica", self.project_name());
+        if title != self.title_shown {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title_shown = title;
+        }
+    }
+
+    /// Diálogo "¿Guardar los cambios?" antes de reemplazar el proyecto.
+    fn pending_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending.clone() else { return };
+        let mut choice = None;
+        let resp = egui::Modal::new(egui::Id::unique("guardar-cambios")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("¿Guardar los cambios?");
+            ui.add_space(6.0);
+            ui.label(format!("\"{}\" tiene cambios sin guardar. Si continúas sin guardar, se perderán.", self.project_name()));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Guardar").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("No guardar").clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Cancelar").clicked() {
+                    ui.close();
+                }
+            });
+        });
+        match choice {
+            Some(save) => {
+                self.pending = None;
+                if !save || self.save_project(ctx) {
+                    self.run_action(Some(ctx), action);
+                }
+            }
+            None if resp.should_close() => self.pending = None,
+            None => {}
+        }
     }
 
     // ───────────────────────── Análisis de expresiones ─────────────────────────
@@ -395,7 +769,12 @@ impl GraphApp {
         let sources: Vec<Result<String, MathError>> = self
             .items
             .iter()
-            .map(|it| if latex::is_latex(&it.text) { latex::to_plain(&it.text) } else { Ok(it.text.clone()) })
+            .map(|it| match () {
+                // Los textos no son expresiones.
+                _ if it.note.is_some() => Ok(String::new()),
+                _ if latex::is_latex(&it.text) => latex::to_plain(&it.text),
+                _ => Ok(it.text.clone()),
+            })
             .collect();
 
         // 1) Nombres definidos en todas las líneas.
@@ -530,6 +909,7 @@ impl GraphApp {
         let mut kinds = Vec::with_capacity(parsed.len());
         for (i, p) in parsed.into_iter().enumerate() {
             let kind = match p {
+                None if self.items[i].note.is_some() => Kind::Note(interpolate(&self.items[i].text, &env, &lists, &user_funcs, &user_names)),
                 None => Kind::Empty,
                 Some(Err(e)) => Kind::Error { msg: e.0, missing: Vec::new() },
                 Some(Ok(_)) if dup.contains(&i) => Kind::Error { msg: "nombre ya definido en otra línea".into(), missing: Vec::new() },
@@ -661,6 +1041,34 @@ impl GraphApp {
     /// Atajos de teclado: F1 guía, Ctrl+K teclado, Ctrl+Z deshacer borrado (fuera de un campo).
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let editing = ctx.memory(|m| m.focused().is_some());
+        // Archivos: Ctrl+N nuevo, Ctrl+O abrir, Ctrl+S guardar (Mayús: como…), Ctrl+E exportar imagen.
+        let ctrl = egui::Modifiers::COMMAND;
+        let (save_as, save, open, new, export) = ctx.input_mut(|i| {
+            let save_as = i.consume_key(ctrl | egui::Modifiers::SHIFT, Key::S);
+            (save_as, i.consume_key(ctrl, Key::S), i.consume_key(ctrl, Key::O), i.consume_key(ctrl, Key::N), i.consume_key(ctrl, Key::E))
+        });
+        if save_as {
+            self.save_project_as(ctx);
+        } else if save {
+            self.save_project(ctx);
+        }
+        if open {
+            self.request(Some(ctx), FileAction::Open(None));
+        }
+        if new {
+            self.request(Some(ctx), FileAction::New);
+        }
+        if export {
+            self.export_image(ctx, false);
+        }
+        // Soltar un proyecto en la ventana lo abre.
+        let dropped = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).find(|p| project::is_project(p)));
+        if let Some(p) = dropped {
+            self.request(Some(ctx), FileAction::Open(Some(p)));
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.placing_note = false;
+        }
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::NONE, Key::F1) {
                 self.help_open = !self.help_open;
@@ -804,6 +1212,10 @@ impl GraphApp {
                     let id = self.push_item("");
                     self.focus_next = Some(id);
                 }
+                let resp = ui.button(RichText::new("📁").size(16.0)).on_hover_text("Proyecto: guardar, abrir, exportar imagen");
+                egui::Popup::menu(&resp)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| self.project_menu(ui));
             });
         });
         ui.separator();
@@ -828,7 +1240,16 @@ impl GraphApp {
                     let (rect, resp) = ui.allocate_exact_size(vec2(row_h, row_h), Sense::click());
                     let c = rect.center();
                     let r = (row_h * 0.32).min(11.0);
-                    if kind.is_graph() {
+                    let is_note = item.note.is_some();
+                    if is_note {
+                        // Los textos se reconocen por una T de su color (tenue si está oculto).
+                        let color = item.style.base_color(dark);
+                        let color = if item.visible { color } else { color.gamma_multiply(0.35) };
+                        ui.painter().text(c, Align2::CENTER_CENTER, "T", FontId::proportional(r * 2.0), color);
+                        if resp.hovered() {
+                            ui.painter().circle_stroke(c, r + 3.0, Stroke::new(1.0, ui.visuals().weak_text_color()));
+                        }
+                    } else if kind.is_graph() {
                         let color = item.style.base_color(dark);
                         if item.visible {
                             ui.painter().circle_filled(c, r, color);
@@ -861,7 +1282,16 @@ impl GraphApp {
                             }
                         }
                     });
-                    if kind.is_graph() {
+                    if is_note {
+                        let resp = resp.on_hover_text("Estilo del texto (clic derecho: más opciones)");
+                        let target = EditorTarget { has_line: false, has_fill: false, is_point: false, is_list: false };
+                        egui::Popup::from_toggle_button_response(&resp)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| {
+                                style::style_editor(ui, &mut item.style, &mut item.visible, &target);
+                                note_extras_ui(ui, item);
+                            });
+                    } else if kind.is_graph() {
                         let resp = resp.on_hover_text("Estilo y visibilidad (clic derecho: más opciones)");
                         let target = EditorTarget {
                             has_line: kind.curve().is_some(),
@@ -888,8 +1318,32 @@ impl GraphApp {
                         if ui.button(RichText::new("✕").size(self.settings.expr_size * 0.7)).on_hover_text("Eliminar").clicked() {
                             remove = Some(idx);
                         }
-                        // Escritura matemática salvo mientras se edita (clic para editar).
                         let edit_id = expr_edit_id(item.id);
+                        if is_note {
+                            let resp = ui.add(
+                                TextEdit::multiline(&mut item.text)
+                                    .id(edit_id)
+                                    .desired_rows(1)
+                                    .desired_width(ui.available_width())
+                                    .font(FontId::proportional(self.settings.expr_size))
+                                    .margin(vec2(6.0, 4.0))
+                                    .hint_text("texto sobre la gráfica…"),
+                            )
+                            .on_hover_text("Texto sobre la gráfica. Escribe {a} para mostrar el valor de a.");
+                            if self.focus_next == Some(item.id) {
+                                resp.request_focus();
+                                self.focus_next = None;
+                            }
+                            if resp.gained_focus() {
+                                self.selected = Some(item.id);
+                            }
+                            if resp.has_focus() {
+                                self.last_edit = Some(item.id);
+                            }
+                            changed |= resp.changed();
+                            return;
+                        }
+                        // Escritura matemática salvo mientras se edita (clic para editar).
                         let editing = ui.memory(|m| m.has_focus(edit_id)) || self.focus_next == Some(item.id);
                         let node = self.pretty.get(idx).and_then(Option::as_ref);
                         if let (true, false, Some(node)) = (self.settings.pretty_math && !item.text.trim().is_empty(), editing, node) {
@@ -954,6 +1408,12 @@ impl GraphApp {
                                     }
                                 });
                             }
+                        });
+                    }
+                    // Texto con valores: se muestra cómo queda.
+                    Kind::Note(shown) if shown != &item.text => {
+                        ui.indent(item.id, |ui| {
+                            ui.label(RichText::new(format!("→ {shown}")).size(small).weak());
                         });
                     }
                     Kind::Value(v) => {
@@ -1021,6 +1481,8 @@ impl GraphApp {
                 copy.slider = self.items[idx].slider;
                 copy.domain = self.items[idx].domain;
                 copy.label = self.items[idx].label.clone();
+                // Un texto duplicado se coloca un poco más abajo para que se vea.
+                copy.note = self.items[idx].note.map(|n| Note { y: n.y - 1.5 * n.size as f64 / self.view.scale, ..n });
                 // Una definición duplicada chocaría con la original: se renombra.
                 if let Some((name, _)) = math::scan_definition(&copy.text) {
                     let new_name = self.free_name(&name);
@@ -1045,6 +1507,52 @@ impl GraphApp {
         }
         if changed {
             self.revision += 1;
+        }
+    }
+
+    fn project_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(240.0);
+        let ctx = ui.ctx().clone();
+        let dirty = if self.is_dirty() { "  (sin guardar)" } else { "" };
+        ui.label(RichText::new(format!("{}{dirty}", self.project_name())).strong());
+        ui.separator();
+        let item = |ui: &mut egui::Ui, text: &str, keys: &str| ui.add(egui::Button::new(text).shortcut_text(keys)).clicked();
+        if item(ui, "🗋  Nuevo", "Ctrl+N") {
+            ui.close();
+            self.request(Some(&ctx), FileAction::New);
+        }
+        if item(ui, "🗁  Abrir…", "Ctrl+O") {
+            ui.close();
+            self.request(Some(&ctx), FileAction::Open(None));
+        }
+        ui.add_enabled_ui(!self.recent.is_empty(), |ui| {
+            ui.menu_button("🕘  Recientes", |ui| {
+                for p in self.recent.clone() {
+                    let resp = ui.button(project::stem(&p)).on_hover_text(p.display().to_string());
+                    if resp.clicked() {
+                        ui.close();
+                        self.request(Some(&ctx), FileAction::Open(Some(p)));
+                    }
+                }
+            });
+        });
+        ui.separator();
+        if item(ui, "💾  Guardar", "Ctrl+S") {
+            ui.close();
+            self.save_project(&ctx);
+        }
+        if item(ui, "    Guardar como…", "Ctrl+Mayús+S") {
+            ui.close();
+            self.save_project_as(&ctx);
+        }
+        ui.separator();
+        if item(ui, "🖼  Exportar imagen PNG…", "Ctrl+E") {
+            ui.close();
+            self.export_image(&ctx, false);
+        }
+        if item(ui, "📋  Copiar imagen", "") {
+            ui.close();
+            self.export_image(&ctx, true);
         }
     }
 
@@ -1086,21 +1594,37 @@ impl GraphApp {
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+        self.canvas_rect = rect;
+        // Mientras se captura la imagen no se dibujan controles ni marcas de selección.
+        let clean = self.capture.is_some();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let dark = ui.visuals().dark_mode;
         let painter = ui.painter_at(rect);
+        let notes = self.note_boxes(&painter, rect);
+        let note_under = |p: Pos2| notes.iter().rev().find(|b| b.rect.expand(4.0).contains(p)).map(|b| b.id);
 
-        // Interacción: arrastrar un punto móvil lo mueve; arrastrar el fondo desplaza la vista;
-        // rueda / pellizco = zoom.
+        // Interacción: arrastrar un punto móvil o un texto lo mueve; arrastrar el fondo desplaza
+        // la vista; rueda / pellizco = zoom.
         let pointer = ui.input(|i| i.pointer.hover_pos());
         if resp.drag_started() {
             let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
-            self.dragging = origin.and_then(|p| self.draggable_under(rect, p));
+            self.dragging = origin.and_then(|p| note_under(p).map(Drag::Note).or_else(|| self.draggable_under(rect, p).map(Drag::Point)));
         }
-        if let Some(id) = self.dragging {
+        if let Some(target) = self.dragging {
             if let (true, Some(p)) = (resp.dragged(), pointer) {
-                self.drag_point_to(id, rect, p);
-                self.analyze();
+                match target {
+                    Drag::Point(id) => {
+                        self.drag_point_to(id, rect, p);
+                        self.analyze();
+                    }
+                    Drag::Note(id) => {
+                        let d = resp.drag_delta();
+                        if let Some(n) = self.items.iter_mut().find(|it| it.id == id).and_then(|it| it.note.as_mut()) {
+                            n.x += d.x as f64 / self.view.scale;
+                            n.y -= d.y as f64 / self.view.scale;
+                        }
+                    }
+                }
             }
             if resp.drag_stopped() || !resp.dragged() {
                 self.dragging = None;
@@ -1110,7 +1634,9 @@ impl GraphApp {
             let d = resp.drag_delta();
             self.view.cx -= d.x as f64 / self.view.scale;
             self.view.cy += d.y as f64 / self.view.scale;
-        } else if pointer.is_some_and(|p| resp.hovered() && self.draggable_under(rect, p).is_some()) {
+        } else if self.placing_note && resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        } else if pointer.is_some_and(|p| resp.hovered() && (note_under(p).is_some() || self.draggable_under(rect, p).is_some())) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
         if resp.hovered() {
@@ -1155,10 +1681,11 @@ impl GraphApp {
 
         self.update_geometry(ui.ctx(), rect);
         self.update_pois(rect);
-        self.draw_items(&painter, rect, dark);
+        self.draw_items(&painter, rect, dark, clean);
+        self.draw_notes(ui, &painter, &notes, dark, clean);
 
-        // Rastreo bajo el cursor: primero puntos notables, luego curvas.
-        let mouse = resp.hover_pos().filter(|_| !resp.dragged());
+        // Rastreo bajo el cursor: primero puntos notables, luego curvas (no sobre un texto).
+        let mouse = resp.hover_pos().filter(|p| !resp.dragged() && !clean && !self.placing_note && note_under(*p).is_none());
         let poi_hit = mouse.and_then(|m| self.poi_under(rect, m));
         let curve_hit = if poi_hit.is_none() { mouse.and_then(|m| self.curve_under(rect, m, dark)) } else { None };
 
@@ -1180,12 +1707,140 @@ impl GraphApp {
             draw_tooltip(&painter, rect, p, text, hit.color, dark);
         }
 
-        // Clic: seleccionar la curva bajo el cursor (o deseleccionar).
-        if resp.clicked() && poi_hit.is_none() {
-            self.selected = curve_hit.map(|h| h.id);
+        // Clic: crear un texto (herramienta de texto), seleccionar el texto o la curva bajo el
+        // cursor, o deseleccionar. Doble clic en un texto: editarlo.
+        let click_pos = ui.input(|i| i.pointer.interact_pos());
+        if resp.clicked() {
+            let note = click_pos.and_then(note_under);
+            if let (true, Some(p)) = (self.placing_note, click_pos) {
+                let (x, y) = self.view.to_world(rect, p);
+                self.add_note(x, y);
+                self.placing_note = false;
+            } else if note.is_some() {
+                self.selected = note;
+            } else if poi_hit.is_none() {
+                self.selected = curve_hit.map(|h| h.id);
+            }
         }
+        if resp.double_clicked() {
+            if let Some(id) = click_pos.and_then(note_under) {
+                self.editing_note = Some(id);
+            }
+        }
+        // Clic derecho: añadir un texto en ese punto.
+        if resp.secondary_clicked() {
+            self.context_pos = click_pos;
+        }
+        resp.context_menu(|ui| {
+            if ui.button("T  Añadir texto aquí").clicked() {
+                if let Some(p) = self.context_pos {
+                    let (x, y) = self.view.to_world(rect, p);
+                    self.add_note(x, y);
+                }
+                ui.close();
+            }
+            if ui.button("🖼  Exportar imagen PNG…").clicked() {
+                ui.close();
+                self.export_image(ui.ctx(), false);
+            }
+            if ui.button("📋  Copiar imagen").clicked() {
+                ui.close();
+                self.export_image(ui.ctx(), true);
+            }
+        });
 
-        self.view_buttons(ui, rect);
+        if !clean {
+            self.view_buttons(ui, rect);
+            self.draw_toast(ui, &painter, rect, dark);
+        }
+    }
+
+    /// Recuadros en pantalla de los textos visibles (en orden: el último queda encima).
+    fn note_boxes(&self, painter: &egui::Painter, rect: Rect) -> Vec<NoteBox> {
+        self.items
+            .iter()
+            .zip(&self.kinds)
+            .filter_map(|(it, k)| {
+                let (Some(note), Kind::Note(text), true) = (it.note, k, it.visible) else { return None };
+                // Mientras se edita se muestra el texto tal cual, con sus {…}.
+                let shown = if self.editing_note == Some(it.id) { it.text.clone() } else { text.clone() };
+                let galley = painter.layout_no_wrap(shown, FontId::proportional(note.size), Color32::PLACEHOLDER);
+                let min = self.view.to_screen(rect, note.x, note.y);
+                let size = galley.size().max(vec2(note.size * 0.6, note.size * 1.2));
+                Some(NoteBox { id: it.id, rect: Rect::from_min_size(min, size), galley })
+            })
+            .collect()
+    }
+
+    /// Dibuja los textos; el que se está editando se muestra como un campo de texto.
+    fn draw_notes(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, notes: &[NoteBox], dark: bool, clean: bool) {
+        let mut finished = None;
+        for b in notes {
+            let Some(item) = self.items.iter_mut().find(|it| it.id == b.id) else { continue };
+            let Some(note) = item.note else { continue };
+            let color = item.style.base_color(dark);
+            if self.editing_note == Some(b.id) && !clean {
+                let id = note_edit_id(b.id);
+                let r = Rect::from_min_size(b.rect.min - vec2(6.0, 4.0), vec2(b.rect.width().max(180.0) + 30.0, b.rect.height() + 8.0));
+                let edit = TextEdit::multiline(&mut item.text)
+                    .id(id)
+                    .font(FontId::proportional(note.size))
+                    .text_color(color)
+                    .desired_rows(1)
+                    .desired_width(r.width() - 12.0)
+                    .hint_text("escribe un texto…");
+                let resp = ui.put(r, edit);
+                if !resp.has_focus() && !resp.lost_focus() && !ui.memory(|m| m.had_focus_last_frame(id)) {
+                    resp.request_focus();
+                }
+                if resp.changed() {
+                    self.revision += 1;
+                }
+                if resp.lost_focus() {
+                    finished = Some(b.id);
+                }
+                continue;
+            }
+            if note.background {
+                let bg = if dark { Color32::from_black_alpha(170) } else { Color32::from_white_alpha(215) };
+                painter.rect_filled(b.rect.expand(4.0), 4.0, bg);
+            }
+            if self.selected == Some(b.id) && !clean {
+                painter.rect_stroke(b.rect.expand(5.0), 4.0, Stroke::new(1.5, color.gamma_multiply(0.6)), egui::StrokeKind::Outside);
+            }
+            painter.galley(b.rect.min, b.galley.clone(), color);
+        }
+        // Al terminar de editar, un texto vacío se descarta.
+        if let Some(id) = finished {
+            self.editing_note = None;
+            if let Some(idx) = self.items.iter().position(|it| it.id == id && it.text.trim().is_empty()) {
+                self.items.remove(idx);
+                if self.items.is_empty() {
+                    self.push_item("");
+                }
+                self.revision += 1;
+            }
+        }
+    }
+
+    /// Aviso temporal abajo en el centro de la gráfica.
+    fn draw_toast(&mut self, ui: &egui::Ui, painter: &egui::Painter, rect: Rect, dark: bool) {
+        let now = ui.input(|i| i.time);
+        let Some((text, error, until)) = &mut self.toast else { return };
+        if until.is_infinite() {
+            *until = now + 6.0;
+        }
+        if now > *until {
+            self.toast = None;
+            return;
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(*until - now));
+        let color = if *error { ui.visuals().error_fg_color } else if dark { Color32::from_gray(230) } else { Color32::from_gray(30) };
+        let galley = painter.layout(text.clone(), FontId::proportional(15.0), color, rect.width() - 80.0);
+        let r = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 40.0), galley.size()).expand2(vec2(14.0, 9.0));
+        painter.rect_filled(r, 8.0, if dark { Color32::from_gray(45) } else { Color32::from_gray(245) });
+        painter.rect_stroke(r, 8.0, Stroke::new(1.0, color.gamma_multiply(0.4)), egui::StrokeKind::Inside);
+        painter.galley(r.min + vec2(14.0, 9.0), galley, color);
     }
 
     /// Recalcula las curvas si cambió la vista, el tamaño o alguna expresión.
@@ -1263,7 +1918,7 @@ impl GraphApp {
         self.pois = Some((full_key, kept));
     }
 
-    fn draw_items(&self, painter: &egui::Painter, rect: Rect, dark: bool) {
+    fn draw_items(&self, painter: &egui::Painter, rect: Rect, dark: bool, clean: bool) {
         let Some((_, geo)) = &self.geometry else { return };
 
         // 1) Rellenos de desigualdades (debajo de todo).
@@ -1305,7 +1960,7 @@ impl GraphApp {
                 Kind::Ineq { strict: true, .. } if st.line == LineStyle::Solid => LineStyle::Dashed,
                 _ => st.line,
             };
-            if self.selected == Some(item.id) {
+            if self.selected == Some(item.id) && !clean {
                 let halo = st.base_color(dark).gamma_multiply(0.25);
                 for l in &g.lines {
                     style::draw_polyline(painter, l, LineStyle::Solid, halo, st.width + 6.0);
@@ -1348,7 +2003,7 @@ impl GraphApp {
         }
 
         // 4) Puntos notables de la curva seleccionada.
-        if self.settings.show_pois {
+        if self.settings.show_pois && !clean {
             if let Some((_, pois)) = &self.pois {
                 let ring = if dark { Color32::from_gray(24) } else { Color32::WHITE };
                 for p in pois {
@@ -1521,7 +2176,23 @@ impl GraphApp {
                 }
             }
         }
+        // Herramienta de texto, separada de los botones de la vista.
+        let r = Rect::from_min_size(pos2(x, rect.top() + 24.0 + 3.0 * (size.y + 6.0)), size);
+        let tool = egui::Button::new(RichText::new("T").size(18.0).strong()).selected(self.placing_note);
+        if ui.put(r, tool).on_hover_text("Añadir texto: haz clic donde quieras ponerlo (Esc cancela)").clicked() {
+            self.placing_note = !self.placing_note;
+        }
     }
+}
+
+/// Ajustes propios de un texto: tamaño y recuadro de fondo.
+fn note_extras_ui(ui: &mut egui::Ui, item: &mut Item) {
+    let Some(note) = &mut item.note else { return };
+    ui.separator();
+    ui.label("Texto");
+    ui.add(egui::Slider::new(&mut note.size, 10.0..=64.0).step_by(1.0).text("Tamaño"));
+    ui.checkbox(&mut note.background, "Fondo detrás del texto");
+    ui.label(RichText::new("Arrástralo en la gráfica para moverlo; doble clic para editarlo.").small().weak());
 }
 
 /// Deslizador con reproducción y sus ajustes. Devuelve si cambió el texto o el rango.
@@ -1752,6 +2423,10 @@ fn is_missing(name: &str, env: &Env, lists: &Lists) -> bool {
 }
 
 /// Id del campo de texto de una expresión (para que el teclado sepa dónde escribir).
+fn note_edit_id(item_id: u64) -> egui::Id {
+    egui::Id::unique(("texto", item_id))
+}
+
 fn expr_edit_id(item_id: u64) -> egui::Id {
     egui::Id::unique(("expresion", item_id))
 }
@@ -2165,6 +2840,32 @@ pub fn format_number(v: f64) -> String {
     if s == "-0" { "0".into() } else { s.into() }
 }
 
+/// Sustituye cada `{expr}` de un texto por su valor: "a = {a}" → "a = 0.5".
+/// Un punto con nombre se muestra como (x, y); lo que no se puede calcular queda como "{?}".
+fn interpolate(text: &str, env: &Env, lists: &Lists, user_funcs: &HashSet<String>, user_names: &HashSet<String>) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        let Some(len) = rest[open..].find('}') else { break };
+        out.push_str(&rest[..open]);
+        let src = rest[open + 1..open + len].trim();
+        let value = match lists.points.get(src).map(Vec::as_slice) {
+            Some([(x, y)]) => Some(format!("({}, {})", format_number(*x), format_number(*y))),
+            _ => math::parse_expr(src, user_funcs, user_names)
+                .and_then(|e| math::compile(&e, env))
+                .ok()
+                .filter(|c| !(c.uses_x() || c.uses_y() || c.uses_t() || c.uses_theta() || c.uses_r()))
+                .map(|c| math::value_of(&c))
+                .filter(|z| z.re.is_finite() && z.im.is_finite())
+                .map(|z| if z.im == 0.0 { format_number(z.re) } else { format_complex(z) }),
+        };
+        out.push_str(&value.unwrap_or_else(|| "{?}".into()));
+        rest = &rest[open + len + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl eframe::App for GraphApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(&ui.ctx().clone());
@@ -2195,6 +2896,11 @@ impl eframe::App for GraphApp {
         self.apply_theme(&ui.ctx().clone());
 
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
+
+        let ctx = ui.ctx().clone();
+        self.finish_capture(&ctx);
+        self.pending_dialog(&ctx);
+        self.update_title(&ctx);
 
         // Guía de uso (ventana aparte). "Probar" añade el ejemplo a la lista.
         for example in help::help_window(&ui.ctx().clone(), &mut self.help_open, &mut self.help_section) {
@@ -2300,6 +3006,124 @@ mod tests {
         assert_eq!(app.items.len(), 1);
         app.undo_delete();
         assert_eq!(app.items[1].text, "y = a x");
+    }
+
+    #[test]
+    fn notes() {
+        let mut app = app_with(&["a = 0.5", "A = (1, 2)", "y = a x"]);
+        let id = app.add_note(1.0, 2.0);
+        let idx = app.items.iter().position(|it| it.id == id).unwrap();
+        // Un texto no se interpreta como expresión aunque lo parezca.
+        app.items[idx].text = "y = x^2, a = {a}, A = {A}, {2a + 1}, {z}".into();
+        app.revision += 1;
+        app.analyze();
+        let Kind::Note(shown) = &app.kinds[idx] else { panic!() };
+        assert_eq!(shown, "y = x^2, a = 0.5, A = (1, 2), 2, {?}");
+        assert!(matches!(app.kinds[2], Kind::Curve(_)));
+    }
+
+    /// Un fotograma del lienzo sin ventana, con los eventos de ratón dados.
+    fn canvas_frame(ctx: &egui::Context, app: &mut GraphApp, events: Vec<egui::Event>) {
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            app.analyze();
+            app.canvas(ui);
+        });
+        out.textures_delta.clear();
+    }
+
+    fn press(p: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+
+    #[test]
+    fn notes_on_canvas() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(&["y = x"]);
+        canvas_frame(&ctx, &mut app, vec![]);
+        let rect = app.canvas_rect;
+
+        // Herramienta T: el clic crea un texto en ese punto, que queda editándose.
+        app.placing_note = true;
+        let p = pos2(500.0, 200.0);
+        canvas_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(p), press(p, true)]);
+        canvas_frame(&ctx, &mut app, vec![press(p, false)]);
+        let note = app.items.last().unwrap();
+        let id = note.id;
+        assert!(!app.placing_note);
+        assert_eq!(app.editing_note, Some(id));
+        let n = note.note.unwrap();
+        assert!(app.view.to_screen(rect, n.x, n.y).distance(p) < 1.0);
+
+        // Escribir y terminar la edición.
+        app.items.last_mut().unwrap().text = "hola".into();
+        app.editing_note = None;
+        app.revision += 1;
+        canvas_frame(&ctx, &mut app, vec![]);
+
+        // Arrastrar el texto lo mueve con el ratón.
+        let start = p + vec2(10.0, 8.0);
+        let mut evs = vec![egui::Event::PointerMoved(start), press(start, true)];
+        canvas_frame(&ctx, &mut app, std::mem::take(&mut evs));
+        for k in 1..=10 {
+            canvas_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(start + vec2(10.0 * k as f32, 5.0 * k as f32))]);
+        }
+        canvas_frame(&ctx, &mut app, vec![press(start + vec2(100.0, 50.0), false)]);
+        let n = app.items.iter().find(|it| it.id == id).unwrap().note.unwrap();
+        let moved = app.view.to_screen(rect, n.x, n.y);
+        assert!(moved.x > p.x + 50.0 && moved.y > p.y + 20.0, "{moved:?}");
+    }
+
+    #[test]
+    fn project_roundtrip() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(&["a = 2", "y = a x"]);
+        app.add_note(-1.0, 3.0);
+        let id = app.items.last().unwrap().id;
+        app.items.last_mut().unwrap().text = "pendiente {a}".into();
+        app.view.cx = 4.0;
+        assert!(app.is_dirty());
+        let path = std::env::temp_dir().join("appgrafica-test.agraf");
+        assert!(app.save_to(&ctx, path.clone()));
+        assert!(!app.is_dirty());
+        assert_eq!(app.recent.first(), Some(&path));
+
+        let mut other = GraphApp::default();
+        other.load_from(&path).unwrap();
+        other.analyze();
+        assert_eq!(other.items.len(), 3);
+        assert_eq!(other.view.cx, 4.0);
+        assert!(other.next_id > id);
+        assert!(matches!(&other.kinds[2], Kind::Note(t) if t == "pendiente 2"));
+        assert_eq!(other.items[2].note.map(|n| (n.x, n.y)), Some((-1.0, 3.0)));
+        assert!(!other.is_dirty());
+        other.items[0].text = "a = 3".into();
+        assert!(other.is_dirty());
+        // Un archivo que no es un proyecto da error sin tocar lo abierto.
+        std::fs::write(&path, "hola").unwrap();
+        assert!(other.load_from(&path).is_err());
+        assert_eq!(other.items[0].text, "a = 3");
+        let _ = std::fs::remove_file(path);
+
+        // Exportar imagen: se recorta la zona de la gráfica de la captura de la ventana.
+        let png = std::env::temp_dir().join("appgrafica-export.png");
+        let window = egui::ColorImage::filled([300, 200], Color32::WHITE);
+        other.canvas_rect = Rect::from_min_max(pos2(100.0, 0.0), pos2(400.0, 150.0));
+        let slot = Arc::new(Mutex::new(Some(Arc::new(window))));
+        other.capture = Some(Capture { target: CaptureTarget::File(png.clone()), slot });
+        other.finish_capture(&ctx);
+        assert!(other.capture.is_none());
+        let dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&png).unwrap()));
+        let info = dec.read_info().unwrap().info().clone();
+        assert_eq!((info.width, info.height), (200, 150));
+        let _ = std::fs::remove_file(png);
+
+        // Nuevo: una línea vacía y nada que guardar.
+        other.new_project();
+        assert_eq!(other.items.len(), 1);
+        assert!(!other.is_dirty());
+        assert!(other.project_path.is_none());
     }
 
     #[test]
