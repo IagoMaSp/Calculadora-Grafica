@@ -35,6 +35,8 @@ fn main() {
 fn run(renderer: eframe::Renderer, args: Vec<String>) -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("AppGrafica")
+        // Identificador de la ventana: la asocia a su acceso (.desktop) y a su icono.
+        .with_app_id("appgrafica")
         .with_inner_size([1200.0, 760.0])
         .with_min_inner_size([600.0, 400.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {

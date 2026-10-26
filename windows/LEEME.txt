@@ -22,8 +22,11 @@ CÓMO SE USA
 - Haz clic en una curva para ver sus cortes, máximos, mínimos e
   intersecciones.
 - El círculo de color de cada expresión cambia su color, trazo y grosor.
-- Botón ? (arriba a la izquierda): guía completa con ejemplos.
+- Botón ? (o F1): guía completa con ejemplos.
   Botón de engranaje: tema claro/oscuro y tamaño del texto.
+  Botón de teclado (o Ctrl+K): teclado en pantalla con funciones,
+  letras griegas y símbolos.
+- También entiende LaTeX:  y = \frac{x^2}{2}    \int_0^1 x^2 \, dx
 
 Todo lo que escribas se guarda solo al cerrar la aplicación.
 
