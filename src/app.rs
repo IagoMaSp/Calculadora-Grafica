@@ -1318,6 +1318,15 @@ impl GraphApp {
                         if ui.button(RichText::new("✕").size(self.settings.expr_size * 0.7)).on_hover_text("Eliminar").clicked() {
                             remove = Some(idx);
                         }
+                        // Resultado de una cuenta en el mismo renglón, a la derecha.
+                        let result = match kind {
+                            Kind::Value(v) => Some(format_number(*v)),
+                            Kind::Points { value: Some(z), .. } => Some(format_complex(*z)),
+                            _ => None,
+                        };
+                        if let Some(r) = result {
+                            result_chip(ui, &r, self.settings.expr_size);
+                        }
                         let edit_id = expr_edit_id(item.id);
                         if is_note {
                             let resp = ui.add(
@@ -1416,11 +1425,6 @@ impl GraphApp {
                             ui.label(RichText::new(format!("→ {shown}")).size(small).weak());
                         });
                     }
-                    Kind::Value(v) => {
-                        ui.indent(item.id, |ui| {
-                            ui.label(RichText::new(format!("= {}", format_number(*v))).strong().size(self.settings.expr_size * 0.9));
-                        });
-                    }
                     Kind::Slider { name, value } => {
                         ui.indent(item.id, |ui| {
                             if slider_ui(ui, item, name, *value) {
@@ -1431,7 +1435,6 @@ impl GraphApp {
                     Kind::Points { value: Some(z), .. } => {
                         ui.indent(item.id, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(format!("= {}", format_complex(*z))).strong().size(self.settings.expr_size * 0.9));
                                 let polar = format!("|z| = {}   arg = {}", format_number(z.norm()), format_number(z.arg()));
                                 ui.label(RichText::new(polar).size(self.settings.expr_size * 0.7).weak());
                             });
@@ -2385,6 +2388,20 @@ fn point_extras_ui(ui: &mut egui::Ui, item: &mut Item, name: Option<&str>, singl
 
 /// Expresión con escritura matemática, en un recuadro como el del campo de texto.
 /// Si no cabe a lo ancho, se reduce (hasta el 60 %).
+/// Resultado "= valor" en un recuadro tenue, como etiqueta al final del renglón.
+/// Un número muy largo se acorta (el valor completo queda en la ayuda emergente).
+fn result_chip(ui: &mut egui::Ui, value: &str, size: f32) {
+    let max_chars = 18;
+    let shown = if value.chars().count() > max_chars { format!("{}…", value.chars().take(max_chars - 1).collect::<String>()) } else { value.to_string() };
+    let text = RichText::new(format!("= {shown}")).size(size * 0.9).strong();
+    let frame = egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 3));
+    frame.show(ui, |ui| ui.label(text)).response.on_hover_text(format!("= {value}"));
+}
+
 fn math_view(ui: &mut egui::Ui, node: &pretty::Node, size: f32) -> egui::Response {
     let color = ui.visuals().strong_text_color();
     let painter = ui.painter().clone();
