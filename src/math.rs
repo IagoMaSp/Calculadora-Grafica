@@ -172,32 +172,6 @@ const CONSTANTS: &[(&str, f64)] = &[
     ("inf", f64::INFINITY),
 ];
 
-/// Nombre con el que se muestra una función de un argumento.
-pub fn func1_display(f: Func1) -> &'static str {
-    match f {
-        Func1::Asin => "arcsin",
-        Func1::Acos => "arccos",
-        Func1::Atan => "arctan",
-        Func1::Asec => "arcsec",
-        Func1::Acsc => "arccsc",
-        Func1::Acot => "arccot",
-        Func1::Asinh => "arsinh",
-        Func1::Acosh => "arcosh",
-        Func1::Atanh => "artanh",
-        Func1::Gamma => "Γ",
-        Func1::LnGamma => "ln Γ",
-        Func1::LambertW => "W",
-        Func1::Fact => "!",
-        Func1::CAbs => "abs",
-        _ => FUNC1_NAMES.iter().find(|(_, g)| *g == f).map_or("?", |(n, _)| n),
-    }
-}
-
-/// Nombre con el que se muestra una función de dos argumentos.
-pub fn func2_display(f: Func2) -> &'static str {
-    FUNC2_NAMES.iter().find(|(_, g)| *g == f).map_or("?", |(n, _)| n)
-}
-
 /// Funciones con sintaxis propia (no van en las tablas de arriba).
 const SPECIAL_FUNCS: &[&str] = &["sum", "prod", "int", "integral", "deriv", "diff"];
 
@@ -620,7 +594,7 @@ fn apply_power(e: Expr, power: Option<Expr>) -> Expr {
     }
 }
 
-fn is_builtin_func(name: &str) -> bool {
+pub fn is_builtin_func(name: &str) -> bool {
     FUNC1_NAMES.iter().any(|(n, _)| *n == name) || FUNC2_NAMES.iter().any(|(n, _)| *n == name) || SPECIAL_FUNCS.contains(&name)
 }
 

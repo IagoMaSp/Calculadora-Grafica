@@ -6,7 +6,9 @@ Calculadora gráfica de escritorio (estilo Desmos/GeoGebra) escrita en Rust con
 - Funciones, ecuaciones implícitas, desigualdades, restricciones `{x > 0}`.
 - Paramétricas, polares, puntos (arrastrables), listas.
 - Deslizadores animados, números complejos, sumas, integrales y derivadas.
-- Escritura matemática y notación LaTeX (`\frac{x}{2}`), teclado en pantalla.
+- Editor matemático visual (como Desmos): fracciones, exponentes, raíces y ∑ ∏ ∫ con
+  casillas que se rellenan haciendo clic. También acepta texto y LaTeX (`\frac{x}{2}`).
+  Teclado en pantalla.
 - Textos sobre la gráfica para explicar cosas, con valores que se actualizan (`a = {a}`).
 - Proyectos: guardar y abrir trabajos en archivos `.agraf`; exportar la gráfica como PNG
   o copiarla al portapapeles.
