@@ -3,6 +3,7 @@
 
 mod analysis;
 mod app;
+mod editor;
 mod help;
 mod keyboard;
 mod latex;
@@ -11,6 +12,8 @@ mod plot;
 mod points;
 mod pretty;
 mod project;
+#[cfg(test)]
+mod snapshot;
 mod special;
 mod style;
 

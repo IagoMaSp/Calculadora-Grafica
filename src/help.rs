@@ -30,7 +30,8 @@ const SECTIONS: &[Section] = &[
             H("El panel de expresiones"),
             P("Cada línea es una expresión. Pulsa Enter al final de una línea para crear otra debajo, o usa el botón ＋ de arriba. El botón ✕ borra la línea."),
             P("Si una expresión tiene un error, aparece un aviso en rojo debajo explicando qué falta o qué está mal."),
-            P("Fuera de edición, las expresiones se muestran con escritura matemática: los exponentes arriba, las fracciones apiladas, las raíces con su signo… Haz clic sobre una para volver a editarla como texto."),
+            P("Se escribe directamente en notación matemática: al pulsar / se crea una fracción, ^ sube al exponente, sqrt pone una raíz y sum una sumatoria con sus límites como casillas. Mira la sección \"Editor matemático\"."),
+            P("El resultado de una cuenta aparece a la derecha, en el mismo renglón."),
             P("El círculo de color a la izquierda de cada línea abre su estilo: color, tipo de trazo, grosor, opacidad y visibilidad."),
             H("Pruébalo"),
             Ex("y = x^2 - 2", "una parábola"),
@@ -111,6 +112,36 @@ const SECTIONS: &[Section] = &[
             Tip("Cualquier letra puede ser un deslizador, también t (si no la defines, t es el parámetro de las paramétricas). r y θ (theta) se reservan para las polares."),
             Tip("Los paréntesis que agrupan se cierran solos al final: (x + 2 funciona. Los de una función sí hay que cerrarlos: sin(x da error."),
             Tip("La letra i es la unidad imaginaria (mira la sección Números complejos)."),
+        ],
+    },
+    Section {
+        title: "Editor matemático",
+        blocks: &[
+            P("Las expresiones se escriben directamente en notación matemática, como en un cuaderno. Las casillas grises son huecos por rellenar: haz clic en una (o llega con las flechas) y escribe."),
+            H("Qué crea cada tecla"),
+            Table(&[
+                ("/", "fracción: lo escrito justo antes pasa al numerador y sigues en el denominador"),
+                ("^", "exponente; → para salir de él"),
+                ("_", "subíndice (a₁, x₂…)"),
+                ("( [ { |", "paréntesis, corchetes, llaves y valor absoluto; ) sale del paréntesis"),
+                ("sqrt, root", "raíz cuadrada; raíz n-ésima con su índice"),
+                ("sum, prod", "∑ y ∏ con casillas para \"n=\", el límite de arriba y la expresión"),
+                ("int", "∫ con sus límites, la expresión y la variable (dx)"),
+                ("pi, theta, tau", "se convierten en π, θ, τ"),
+                ("<=  >=  *", "se convierten en ≤, ≥ y ·"),
+            ]),
+            H("Moverse y borrar"),
+            Table(&[
+                ("← →", "recorren la expresión entrando y saliendo de fracciones, exponentes y casillas"),
+                ("↑ ↓", "entre numerador y denominador, o entre los límites de ∑ ∏ ∫; en el borde, pasan a la línea de arriba o de abajo"),
+                ("Tab", "salta a la siguiente casilla vacía"),
+                ("⌫", "tras una fracción o raíz entra en ella; al principio de una casilla deshace la estructura y deja su contenido"),
+                ("Mayús + ← →", "seleccionar; Ctrl+A selecciona todo; Ctrl+C / Ctrl+X / Ctrl+V copian, cortan y pegan como texto"),
+                ("Esc", "dejar de editar"),
+            ]),
+            Ex("sum(n, 1/n^2, 1, 100)", "una sumatoria: haz clic en sus límites para cambiarlos"),
+            Ex("y = (x^2 + 1)/(x - 1)", "una fracción"),
+            Tip("Si prefieres escribir como texto plano (x^2/2, sqrt(x)…), desactiva \"Editor matemático\" en ⚙ Ajustes. Las dos formas guardan lo mismo."),
         ],
     },
     Section {
@@ -405,7 +436,7 @@ const SECTIONS: &[Section] = &[
                 ("Fuente monoespaciada", "letra de ancho fijo para las expresiones"),
                 ("Números de los ejes", "tamaño de las etiquetas de la cuadrícula"),
                 ("Puntos notables", "activarlos o desactivarlos"),
-                ("Escritura matemática", "mostrar las expresiones con formato matemático o como texto"),
+                ("Editor matemático", "escribir sobre la notación matemática o, desactivado, como texto"),
             ]),
             P("Tus expresiones, estilos y ajustes se guardan automáticamente al cerrar la aplicación. Para tener varios trabajos separados, usa los proyectos (menú 📁)."),
         ],
@@ -504,4 +535,10 @@ fn block_ui(ui: &mut egui::Ui, b: &Block, to_add: &mut Vec<String>) {
             ui.add_space(6.0);
         }
     }
+}
+
+/// Todos los ejemplos de la guía (para probarlos en los tests).
+#[cfg(test)]
+pub fn examples() -> Vec<&'static str> {
+    SECTIONS.iter().flat_map(|s| s.blocks.iter()).filter_map(|b| if let Ex(e, _) = b { Some(*e) } else { None }).collect()
 }

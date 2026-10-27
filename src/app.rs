@@ -10,13 +10,13 @@ use eframe::egui::{
 };
 
 use crate::analysis::{self, Curve, Poi};
+use crate::editor;
 use crate::help;
 use crate::keyboard::{self, KeyboardState};
 use crate::latex;
 use crate::math::{self, C64, CondPoint, Compiled, Env, Expr, MathError, Restriction, Statement};
 use crate::plot::{self, GridColors, Polyline, View};
 use crate::points::{self, Coord, ListValue, Lists};
-use crate::pretty;
 use crate::project;
 use crate::style::{self, EditorTarget, LineStyle, Style};
 
@@ -281,9 +281,9 @@ pub struct GraphApp {
     revision: u64,
     #[serde(skip)]
     kinds: Vec<Kind>,
-    /// Escritura matemática de cada línea (si se pudo leer).
+    /// Estado del editor matemático de cada línea.
     #[serde(skip)]
-    pretty: Vec<Option<pretty::Node>>,
+    editors: HashMap<u64, editor::State>,
     #[serde(skip)]
     analyzed_revision: Option<u64>,
     #[serde(skip)]
@@ -407,7 +407,7 @@ impl Default for GraphApp {
             settings: Settings::default(),
             revision: 1,
             kinds: Vec::new(),
-            pretty: Vec::new(),
+            editors: HashMap::new(),
             analyzed_revision: None,
             geometry: None,
             pois: None,
@@ -588,7 +588,7 @@ impl GraphApp {
         self.last_edit = None;
         self.deleted.clear();
         self.kinds.clear();
-        self.pretty.clear();
+        self.editors.clear();
         self.analyzed_revision = None;
         self.geometry = None;
         self.pois = None;
@@ -798,14 +798,6 @@ impl GraphApp {
                     (!t.is_empty()).then(|| math::parse_statement(t, &user_funcs, &user_names))
                 }
                 Err(e) => Some(Err(e.clone())),
-            })
-            .collect();
-
-        self.pretty = parsed
-            .iter()
-            .map(|p| match p {
-                Some(Ok((st, rs))) => Some(pretty::statement(st, rs)),
-                _ => None,
             })
             .collect();
 
@@ -1131,6 +1123,26 @@ impl GraphApp {
         };
         let id = self.items[idx].id;
         let edit_id = expr_edit_id(id);
+        // Con el editor matemático, las teclas actúan sobre su árbol (los textos, no).
+        if self.settings.pretty_math && self.items[idx].note.is_none() && !matches!(action, keyboard::Action::Enter) {
+            let item = &mut self.items[idx];
+            let st = self.editors.entry(id).or_insert_with(|| editor::State::new(&item.text));
+            st.sync(&item.text);
+            match action {
+                keyboard::Action::Insert { text, back } => st.insert_template(&text, back),
+                keyboard::Action::Backspace => st.backspace(),
+                keyboard::Action::Left => st.left(false),
+                keyboard::Action::Right => st.right(false),
+                keyboard::Action::Enter => {}
+            }
+            if st.store(&mut item.text) {
+                self.revision += 1;
+            }
+            ctx.memory_mut(|m| m.request_focus(edit_id));
+            self.last_edit = Some(id);
+            self.selected = Some(id);
+            return;
+        }
         let mut chars: Vec<char> = self.items[idx].text.chars().collect();
         let mut state = egui::text_edit::TextEditState::load(ctx, edit_id).unwrap_or_default();
         // Cursor y selección actuales (por defecto, al final del texto).
@@ -1224,6 +1236,8 @@ impl GraphApp {
         let mut add_after = None;
         let mut add_sliders: Option<(usize, Vec<String>)> = None;
         let mut row_action: Option<(usize, RowAction)> = None;
+        // Flechas ↑ ↓ en el borde de una línea: (línea, hacia abajo).
+        let mut focus_move: Option<(usize, bool)> = None;
         let mut changed = false;
         let font = self.settings.expr_font();
         let row_h = self.settings.expr_size + 10.0;
@@ -1352,13 +1366,31 @@ impl GraphApp {
                             changed |= resp.changed();
                             return;
                         }
-                        // Escritura matemática salvo mientras se edita (clic para editar).
-                        let editing = ui.memory(|m| m.has_focus(edit_id)) || self.focus_next == Some(item.id);
-                        let node = self.pretty.get(idx).and_then(Option::as_ref);
-                        if let (true, false, Some(node)) = (self.settings.pretty_math && !item.text.trim().is_empty(), editing, node) {
-                            if math_view(ui, node, self.settings.expr_size).clicked() {
-                                self.focus_next = Some(item.id);
+                        // Editor matemático: se escribe directamente sobre la notación.
+                        if self.settings.pretty_math {
+                            let st = self.editors.entry(item.id).or_insert_with(|| editor::State::new(&item.text));
+                            st.sync(&item.text);
+                            if self.focus_next == Some(item.id) {
+                                ui.memory_mut(|m| m.request_focus(edit_id));
+                                st.cursor_to_end();
+                                self.focus_next = None;
+                            }
+                            let (resp, out) = editor::show(ui, edit_id, st, &mut item.text, self.settings.expr_size, "escribe una expresión…");
+                            if resp.gained_focus() {
                                 self.selected = Some(item.id);
+                            }
+                            if resp.has_focus() {
+                                self.last_edit = Some(item.id);
+                            }
+                            changed |= out.changed;
+                            if out.enter {
+                                add_after = Some(idx);
+                            }
+                            if out.up {
+                                focus_move = Some((idx, false));
+                            }
+                            if out.down {
+                                focus_move = Some((idx, true));
                             }
                             return;
                         }
@@ -1402,6 +1434,9 @@ impl GraphApp {
                 let small = self.settings.expr_size * 0.75;
                 match kind {
                     Kind::Error { msg, missing } => {
+                        // Con el editor, una casilla sin rellenar se explica mejor así.
+                        let empty_slot = self.settings.pretty_math && self.editors.get(&item.id).is_some_and(|st| st.has_empty_slot());
+                        let msg = if empty_slot { "completa las casillas vacías" } else { msg.as_str() };
                         ui.indent(item.id, |ui| {
                             ui.label(RichText::new(format!("⚠ {msg}")).color(ui.visuals().error_fg_color).size(small));
                             if !missing.is_empty() {
@@ -1469,6 +1504,12 @@ impl GraphApp {
                 self.items.insert(idx + 1 + k, item);
             }
             changed = true;
+        }
+        if let Some((idx, down)) = focus_move {
+            let target = if down { idx + 1 } else { idx.wrapping_sub(1) };
+            if let Some(it) = self.items.get(target) {
+                self.focus_next = Some(it.id);
+            }
         }
         if let Some(idx) = add_after {
             let item = self.new_item("");
@@ -1574,7 +1615,7 @@ impl GraphApp {
         ui.checkbox(&mut self.settings.monospace, "Fuente monoespaciada");
         ui.add(egui::Slider::new(&mut self.settings.label_size, 9.0..=24.0).step_by(1.0).text("Números de los ejes"));
         ui.checkbox(&mut self.settings.show_pois, "Puntos notables al seleccionar una curva");
-        ui.checkbox(&mut self.settings.pretty_math, "Escritura matemática (exponentes, fracciones…)");
+        ui.checkbox(&mut self.settings.pretty_math, "Editor matemático (desactívalo para escribir como texto)");
         ui.add_space(4.0);
         if ui.button("Restablecer ajustes").clicked() {
             self.settings = Settings::default();
@@ -2402,29 +2443,6 @@ fn result_chip(ui: &mut egui::Ui, value: &str, size: f32) {
     frame.show(ui, |ui| ui.label(text)).response.on_hover_text(format!("= {value}"));
 }
 
-fn math_view(ui: &mut egui::Ui, node: &pretty::Node, size: f32) -> egui::Response {
-    let color = ui.visuals().strong_text_color();
-    let painter = ui.painter().clone();
-    let composer = pretty::Composer { painter: &painter, color };
-    let pad = vec2(6.0, 5.0);
-    let avail = ui.available_width();
-    let mut layout = composer.layout(node, size);
-    if layout.w > avail - 2.0 * pad.x {
-        let scale = ((avail - 2.0 * pad.x) / layout.w).max(0.6);
-        layout = composer.layout(node, size * scale);
-    }
-    let h = (layout.height() + 2.0 * pad.y).max(size * 1.3 + 8.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(avail, h), Sense::click());
-    let visuals = ui.visuals();
-    ui.painter().rect_filled(rect, 4.0, visuals.text_edit_bg_color());
-    if resp.hovered() {
-        ui.painter().rect_stroke(rect, 4.0, visuals.widgets.hovered.bg_stroke, egui::StrokeKind::Inside);
-    }
-    let baseline = rect.center().y + (layout.asc - layout.desc) / 2.0;
-    layout.paint(&ui.painter_at(rect.shrink(1.0)), pos2(rect.left() + pad.x, baseline), color);
-    resp.on_hover_cursor(egui::CursorIcon::Text)
-}
-
 /// ¿`name` es una variable sin definir (candidata a deslizador)?
 fn is_missing(name: &str, env: &Env, lists: &Lists) -> bool {
     const KNOWN: &[&str] = &["x", "y", "θ", "theta", "r", "i", "e", "pi", "π", "tau", "τ", "inf"];
@@ -2947,6 +2965,8 @@ mod tests {
     fn keyboard_inserts_at_cursor() {
         let ctx = egui::Context::default();
         let mut app = GraphApp::default();
+        // Modo texto (sin el editor matemático).
+        app.settings.pretty_math = false;
         app.items.clear();
         let id = app.push_item("y = 2");
         app.last_edit = Some(id);
@@ -2973,6 +2993,66 @@ mod tests {
         app.apply_key(&ctx, ins("α", 0));
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.items[1].text, "α");
+    }
+
+    #[test]
+    fn keyboard_in_math_editor() {
+        let ctx = egui::Context::default();
+        let mut app = GraphApp::default();
+        app.items.clear();
+        let id = app.push_item("y = ");
+        app.last_edit = Some(id);
+        let ins = |text: &str, back: usize| keyboard::Action::Insert { text: text.into(), back };
+        // ∑ del teclado: el cursor queda en el cuerpo.
+        app.apply_key(&ctx, ins("sum(n, , 1, 10)", 8));
+        app.apply_key(&ctx, ins("n", 0));
+        app.apply_key(&ctx, ins("^2", 0));
+        assert_eq!(app.items[0].text, "y = sum(n, n^2, 1, 10)");
+        app.analyze();
+        let Kind::Curve(Curve::Fx(f)) = &app.kinds[0] else { panic!() };
+        assert_eq!(f.eval(0.0, 0.0), 385.0);
+        // ⌫ tras el exponente entra en él; el siguiente borra el 2.
+        app.apply_key(&ctx, keyboard::Action::Backspace);
+        assert_eq!(app.items[0].text, "y = sum(n, n^2, 1, 10)");
+        app.apply_key(&ctx, keyboard::Action::Backspace);
+        assert_eq!(app.items[0].text, "y = sum(n, n^(), 1, 10)");
+    }
+
+    /// Imagen de la app sin ventana (APPGRAFICA_SNAPSHOTS=carpeta para guardarla).
+    fn snapshot_of(app: &mut GraphApp, name: &str, frames: Vec<Vec<egui::Event>>, dark: bool, focus: Option<u64>) {
+        let img = crate::snapshot::render([1000.0, 560.0], 1.5, frames, |ui| {
+            ui.ctx().set_theme(if dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
+            if let Some(id) = focus {
+                ui.memory_mut(|m| m.request_focus(expr_edit_id(id)));
+            }
+            app.analyze();
+            egui::Panel::left("expresiones").default_size(430.0).show(ui, |ui| app.expressions_panel(ui));
+            app.analyze();
+            egui::CentralPanel::no_frame().show(ui, |ui| app.canvas(ui));
+        });
+        crate::snapshot::save(name, &img);
+    }
+
+    #[test]
+    fn math_editor_snapshot() {
+        let mut app = app_with(&[
+            "y = x^2/2 - 3",
+            "f(x) = sqrt(x + 1) + root(3, x)",
+            "sum(n, 1/n^2, 1, 100)",
+            "y = |x - 2| {x > 0}",
+            "int(x, e^(-x^2), 0, 1)",
+            "y = d/dx(sin(x)^2)",
+            "a_1 = 2pi",
+            "",
+        ]);
+        let ctx = egui::Context::default();
+        let id = app.items.last().unwrap().id;
+        app.last_edit = Some(id);
+        app.apply_key(&ctx, keyboard::Action::Insert { text: "prod(n, , 1, )".into(), back: 6 });
+        app.focus_next = None;
+        let frames = vec![vec![], vec![], vec![]];
+        snapshot_of(&mut app, "editor-claro", frames.clone(), false, Some(id));
+        snapshot_of(&mut app, "editor-oscuro", frames, true, None);
     }
 
     fn app_with(lines: &[&str]) -> GraphApp {
@@ -3151,6 +3231,5 @@ mod tests {
         assert!((c.eval(4.0, 0.0) - 10.0).abs() < 1e-12);
         assert!(matches!(app.kinds[2], Kind::Value(v) if v == 10.0));
         assert!(matches!(app.kinds[3], Kind::Error { .. }));
-        assert!(app.pretty[0].is_some());
     }
 }
